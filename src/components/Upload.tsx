@@ -1,0 +1,342 @@
+"use client";
+import { useCallback, useRef, useState } from "react";
+
+const ACCEPT = [".csv", ".xlsx", ".seospider", ".dbseospider"];
+const GB = 1024 * 1024 * 1024;
+
+/**
+ * Limits differ by format because the parsers differ:
+ *  - CSV is stream-parsed chunk by chunk, so the file never sits in memory whole.
+ *    Effectively unlimited; the cap is a sanity check.
+ *  - XLSX and .dbseospider MUST be loaded into memory in full (SheetJS needs the
+ *    whole workbook; SQLite needs the whole database). Past roughly 1.5GB a
+ *    browser tab runs out of address space no matter what we allow here.
+ */
+const LIMITS: { ext: string; max: number; streamed: boolean }[] = [
+  { ext: ".csv", max: 16 * GB, streamed: true },
+  { ext: ".xlsx", max: 2 * GB, streamed: false },
+  { ext: ".dbseospider", max: 2 * GB, streamed: false },
+  { ext: ".seospider", max: 2 * GB, streamed: false },
+];
+
+const fmtSize = (bytes: number): string =>
+  bytes >= GB ? `${(bytes / GB).toFixed(1)}GB` : `${Math.round(bytes / 1024 / 1024)}MB`;
+
+export function validateCrawlFile(file: File): string | null {
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".bat") || name.endsWith(".cmd")) {
+    return (
+      "That's the converter — it runs on your computer, not here.\n\n" +
+      "1. Close Screaming Frog completely (check the system tray)\n" +
+      "2. In Windows Explorer, drag your .dbseospider file ONTO this .bat file\n" +
+      "3. A window opens and runs the export — wait for SUCCESS\n" +
+      "4. It creates an \"auditforge-export\" folder next to your project file\n" +
+      "5. Come back here and drop internal_all.csv on this upload zone\n" +
+      "6. Add all_inlinks.csv in the \"All Inlinks\" slot for link-equity modeling"
+    );
+  }
+  const rule = LIMITS.find((l) => name.endsWith(l.ext));
+  if (!rule) return `"${file.name}" isn't an accepted format. Upload ${ACCEPT.join(", ")}.`;
+  if (file.size === 0) return `"${file.name}" is empty.`;
+  if (file.size > rule.max) {
+    return rule.streamed
+      ? `"${file.name}" is ${fmtSize(file.size)}, past the ${fmtSize(rule.max)} ceiling. Split the export and audit it in parts.`
+      : `"${file.name}" is ${fmtSize(file.size)}. ${rule.ext} files must be loaded into memory whole, and browsers run out of address space past ${fmtSize(
+          rule.max
+        )}. Export "Internal: All" as CSV from Screaming Frog instead — CSV is stream-parsed, so size stops mattering.`;
+  }
+  return null;
+}
+
+/** Non-blocking heads-up for files that are legal but heavy. */
+export function crawlFileWarning(file: File): string | null {
+  const name = file.name.toLowerCase();
+  const streamed = name.endsWith(".csv");
+  if (!streamed && file.size > 700 * 1024 * 1024) {
+    return `${fmtSize(file.size)} ${name.endsWith(".xlsx") ? "XLSX" : "project file"} — this format loads into memory whole, so the tab may run heavy or crash. If it struggles, export "Internal: All" as CSV (stream-parsed, no size ceiling) and use that instead.`;
+  }
+  if (streamed && file.size > 2 * GB) {
+    return `${fmtSize(file.size)} CSV — parsing streams fine, but a crawl this large produces a lot of rows to hold in memory. Close other tabs before starting.`;
+  }
+  return null;
+}
+
+/** Classify a CSV by its header row so multiple files can be dropped together. */
+export async function classifyCsv(file: File): Promise<"crawl" | "inlinks" | "gsc" | "issues"> {
+  try {
+    const head = (await file.slice(0, 4096).text()).toLowerCase();
+    const firstLine = head.split(/\r?\n/)[0] ?? "";
+    // Checked first: this header also contains "urls", which would otherwise
+    // fall through to the crawl branch.
+    if (firstLine.includes("issue name") && firstLine.includes("issue priority")) return "issues";
+    if (firstLine.includes("source") && firstLine.includes("destination")) return "inlinks";
+    if ((firstLine.includes("address") || firstLine.includes("url")) && head.includes("status code")) return "crawl";
+    if (firstLine.includes("clicks") && firstLine.includes("impressions")) return "gsc";
+  } catch {
+    /* unreadable head — let the crawl parser produce the real error */
+  }
+  return "crawl";
+}
+
+interface Props {
+  onCrawlFile: (f: File) => void;
+  onInlinksFile: (f: File) => void;
+  onGscFile: (f: File) => void;
+  onIssuesFile: (f: File) => void;
+  onSitemapUrl: (u: string) => void;
+  onPreviousAudit: (f: File) => void;
+  busy: boolean;
+  gscStatus: "unknown" | "unconfigured" | "disconnected" | "connected";
+  gscSites: string[];
+  gscSite: string;
+  onGscConnect: () => void;
+  onGscSelect: (site: string) => void;
+  onGscDisconnect: () => void;
+}
+
+export default function Upload({
+  onCrawlFile,
+  onInlinksFile,
+  onGscFile,
+  onIssuesFile,
+  onSitemapUrl,
+  onPreviousAudit,
+  busy,
+  gscStatus,
+  gscSites,
+  gscSite,
+  onGscConnect,
+  onGscSelect,
+  onGscDisconnect,
+}: Props) {
+  const [dragging, setDragging] = useState(false);
+  const [error, setError] = useState("");
+  const [warning, setWarning] = useState("");
+  const [sitemap, setSitemap] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const handleFiles = useCallback(
+    async (fileList: FileList | null | undefined) => {
+      const files = Array.from(fileList ?? []);
+      if (files.length === 0) return;
+      setError("");
+      setWarning("");
+
+      const routed: string[] = [];
+      let crawlFile: File | null = null;
+      for (const file of files) {
+        const name = file.name.toLowerCase();
+        if (name.endsWith(".csv") && files.length > 1) {
+          const kind = await classifyCsv(file);
+          if (kind === "inlinks") {
+            onInlinksFile(file);
+            routed.push(`${file.name} → All Inlinks (Module D)`);
+            continue;
+          }
+          if (kind === "gsc") {
+            onGscFile(file);
+            routed.push(`${file.name} → GSC enrichment`);
+            continue;
+          }
+          if (kind === "issues") {
+            onIssuesFile(file);
+            routed.push(`${file.name} → Issues Overview (cross-check)`);
+            continue;
+          }
+        }
+        if (crawlFile) {
+          setError("Drop one crawl file at a time (plus optional all_inlinks.csv / GSC CSV alongside it).");
+          return;
+        }
+        crawlFile = file;
+      }
+      if (routed.length > 0) setWarning(`Auto-routed: ${routed.join(" · ")}`);
+      if (!crawlFile) return;
+      const err = validateCrawlFile(crawlFile);
+      if (err) {
+        setError(err);
+        return;
+      }
+      const w = crawlFileWarning(crawlFile);
+      if (w) setWarning((prev) => (prev ? `${prev}\n${w}` : w));
+      onCrawlFile(crawlFile);
+    },
+    [onCrawlFile, onInlinksFile, onGscFile, onIssuesFile]
+  );
+
+  return (
+    <div className="space-y-6">
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label="Upload Screaming Frog crawl file"
+        onKeyDown={(e) => e.key === "Enter" && inputRef.current?.click()}
+        onClick={() => inputRef.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          void handleFiles(e.dataTransfer.files);
+        }}
+        className={`cursor-pointer rounded-lg border-2 border-dashed px-8 py-14 text-center transition ${
+          dragging ? "border-forge bg-forge/5" : "border-edge bg-panel/50 hover:border-steel"
+        } ${busy ? "pointer-events-none opacity-50" : ""}`}
+      >
+        <p className="font-mono text-xs uppercase tracking-[0.25em] text-forge">crawl input</p>
+        <p className="mt-3 text-lg">Drop your Screaming Frog crawl here</p>
+        <p className="mt-2 text-sm text-steel">
+          .csv (&quot;Internal: All&quot; — stream-parsed, no practical size limit) · .xlsx · .seospider / .dbseospider (best-effort, ≤2GB)
+        </p>
+        <p className="mt-2 text-xs text-forge/80">
+          Converted a project with the .bat? Drop internal_all.csv and all_inlinks.csv here <em>together</em> — they&apos;re
+          routed automatically.
+        </p>
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept={ACCEPT.join(",")}
+          className="hidden"
+          onChange={(e) => void handleFiles(e.target.files)}
+        />
+      </div>
+      {error && (
+        <p role="alert" className="whitespace-pre-wrap rounded border border-ember/50 bg-ember/10 px-3 py-2 text-sm text-ember">
+          {error}
+        </p>
+      )}
+      {warning && (
+        <p className="whitespace-pre-wrap rounded border border-forge/50 bg-forge/10 px-3 py-2 text-sm text-forge">{warning}</p>
+      )}
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="rounded border border-edge bg-panel/50 p-3 text-sm">
+          <span className="block font-mono text-[10px] uppercase tracking-widest text-steel">
+            optional · All Inlinks export
+          </span>
+          <span className="mt-1 block text-xs text-steel">
+            Unlocks link-equity modeling (Module D). Needed for CSV/XLSX crawls — &quot;Internal: All&quot; has inlink
+            counts only, not the link graph. For .dbseospider projects we try to read the edges automatically.
+          </span>
+          <input
+            type="file"
+            accept=".csv"
+            disabled={busy}
+            className="mt-2 block w-full text-xs file:mr-2 file:rounded file:border file:border-edge file:bg-ink file:px-2 file:py-1 file:text-xs file:text-slate-300"
+            onChange={(e) => e.target.files?.[0] && onInlinksFile(e.target.files[0])}
+          />
+        </label>
+        <div className="rounded border border-edge bg-panel/50 p-3 text-sm">
+          <span className="block font-mono text-[10px] uppercase tracking-widest text-steel">
+            google search console — automatic
+          </span>
+          {gscStatus === "connected" ? (
+            <>
+              <span className="mt-1 block text-xs text-verdant">
+                ✓ Connected. Pick the property — clicks/impressions are pulled automatically during every audit.
+              </span>
+              <div className="mt-2 flex gap-2">
+                <select
+                  aria-label="GSC property"
+                  value={gscSite}
+                  disabled={busy}
+                  onChange={(e) => onGscSelect(e.target.value)}
+                  className="w-full rounded border border-edge bg-ink px-2 py-1 text-xs text-slate-200"
+                >
+                  <option value="">Auto-match property to crawl domain</option>
+                  {gscSites.map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" className="btn text-xs" onClick={onGscDisconnect} disabled={busy}>
+                  Disconnect
+                </button>
+              </div>
+            </>
+          ) : gscStatus === "unconfigured" ? (
+            <span className="mt-1 block text-xs text-steel">
+              OAuth keys not set on this deployment (see README). Fallback: upload the Search Console
+              Performance → Pages CSV below.
+            </span>
+          ) : (
+            <>
+              <span className="mt-1 block text-xs text-steel">
+                Connect once — every audit then pulls clicks/impressions per URL automatically. Unlocks
+                traffic-weighted Impact Scores &amp; money leaks.
+              </span>
+              <button type="button" className="btn mt-2 text-xs" onClick={onGscConnect} disabled={busy || gscStatus === "unknown"}>
+                Connect Google Search Console
+              </button>
+            </>
+          )}
+          {gscStatus !== "connected" && (
+            <input
+              type="file"
+              accept=".csv"
+              disabled={busy}
+              aria-label="GSC Pages CSV fallback"
+              className="mt-2 block w-full text-xs file:mr-2 file:rounded file:border file:border-edge file:bg-ink file:px-2 file:py-1 file:text-xs file:text-slate-300"
+              onChange={(e) => e.target.files?.[0] && onGscFile(e.target.files[0])}
+            />
+          )}
+        </div>
+        <label className="rounded border border-edge bg-panel/50 p-3 text-sm">
+          <span className="block font-mono text-[10px] uppercase tracking-widest text-steel">
+            optional · Issues Overview export
+          </span>
+          <span className="mt-1 block text-xs text-steel">
+            Screaming Frog&apos;s own issue counts (Reports → Issues Overview). Cross-checked against what AuditForge
+            detects to prove the crawl export is complete, catch missing columns, and rank what isn&apos;t covered yet.
+          </span>
+          <input
+            type="file"
+            accept=".csv"
+            disabled={busy}
+            className="mt-2 block w-full text-xs file:mr-2 file:rounded file:border file:border-edge file:bg-ink file:px-2 file:py-1 file:text-xs file:text-slate-300"
+            onChange={(e) => e.target.files?.[0] && onIssuesFile(e.target.files[0])}
+          />
+        </label>
+        <label className="rounded border border-edge bg-panel/50 p-3 text-sm">
+          <span className="block font-mono text-[10px] uppercase tracking-widest text-steel">optional · sitemap URL</span>
+          <div className="mt-2 flex gap-2">
+            <input
+              type="url"
+              placeholder="https://example.com/sitemap.xml"
+              value={sitemap}
+              disabled={busy}
+              onChange={(e) => setSitemap(e.target.value)}
+              className="w-full rounded border border-edge bg-ink px-2 py-1 text-xs text-slate-200 placeholder:text-steel/50"
+            />
+            <button
+              type="button"
+              className="btn text-xs"
+              disabled={busy || !/^https?:\/\//.test(sitemap)}
+              onClick={() => onSitemapUrl(sitemap)}
+            >
+              Add
+            </button>
+          </div>
+        </label>
+        <label className="rounded border border-edge bg-panel/50 p-3 text-sm">
+          <span className="block font-mono text-[10px] uppercase tracking-widest text-steel">
+            optional · previous audit (.json)
+          </span>
+          <span className="mt-1 block text-xs text-steel">Unlocks delta report: new / fixed / regressed (Module F)</span>
+          <input
+            type="file"
+            accept=".json"
+            disabled={busy}
+            className="mt-2 block w-full text-xs file:mr-2 file:rounded file:border file:border-edge file:bg-ink file:px-2 file:py-1 file:text-xs file:text-slate-300"
+            onChange={(e) => e.target.files?.[0] && onPreviousAudit(e.target.files[0])}
+          />
+        </label>
+      </div>
+    </div>
+  );
+}

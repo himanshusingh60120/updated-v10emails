@@ -1,0 +1,18 @@
+{
+  // Use the workspace TypeScript version so tsc and the editor agree.
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.enablePromptUseWorkspaceTsdk": true,
+  "editor.formatOnSave": false,
+  "files.eol": "\n",
+  // Tailwind IntelliSense needs to know this project's config location.
+  "tailwindCSS.experimental.configFile": "tailwind.config.ts",
+  // Keep the noise down when browsing a 93k-row audit's build output.
+  "files.exclude": {
+    "**/.next": true,
+    "**/node_modules": true
+  },
+  // .env.local holds secrets — never let the editor index or search it.
+  "search.exclude": {
+    "**/.env.local": true
+  }
+}
