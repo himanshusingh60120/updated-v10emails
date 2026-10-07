@@ -7,6 +7,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "bg:start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bg-start.ps1",
+    "bg:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/bg-stop.ps1",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "tsx scripts/smoke.test.ts && tsx scripts/gap-fixes.test.ts && tsx scripts/gap-rules.test.ts && tsx scripts/verification.test.ts && tsx scripts/upload-routing.test.ts && tsx scripts/budget.test.ts && tsx scripts/queue-resilience.test.ts && tsx scripts/report-html.test.ts"
