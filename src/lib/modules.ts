@@ -14,23 +14,21 @@ export function analyzeUrlHygiene(rows: CrawlRow[]): HygieneFinding[] {
   const urls = rows.map((r) => r.url);
 
   // Parameter bloat
-  const paramCounts = new Map<string, string[]>();
+  const paramCounts = new Map<string, { count: number; examples: string[] }>();
   for (const u of urls) {
     try {
       const parsed = new URL(u);
-      for (const key of parsed.searchParams.keys()) {
-        const list = paramCounts.get(key) ?? [];
-        if (list.length < 3) list.push(u);
-        paramCounts.set(key, [...list]);
-        const c = paramCounts.get(key)!;
-        (c as string[] & { n?: number }).n = ((c as string[] & { n?: number }).n ?? 0) + 1;
+      for (const key of new Set(parsed.searchParams.keys())) {
+        const entry = paramCounts.get(key) ?? { count: 0, examples: [] };
+        entry.count++;
+        if (entry.examples.length < 3) entry.examples.push(u);
+        paramCounts.set(key, entry);
       }
     } catch {
       /* skip malformed */
     }
   }
-  for (const [param, examples] of paramCounts) {
-    const count = (examples as string[] & { n?: number }).n ?? examples.length;
+  for (const [param, { count, examples }] of paramCounts) {
     if (count >= 20) {
       findings.push({
         pattern: `?${param}=`,
@@ -96,8 +94,8 @@ export function analyzeUrlHygiene(rows: CrawlRow[]): HygieneFinding[] {
       recommendation: "Force HTTPS with a blanket 301 and add HSTS (see header audit).",
     });
 
-  // Infinite-space heuristics: calendar paths, very deep repetition
-  const calendar = urls.filter((u) => /\/\d{4}\/\d{2}(\/\d{2})?\//.test(u));
+  // Flag calendar/archive endpoints, not ordinary dated article permalinks.
+  const calendar = urls.filter((u) => /\/\d{4}\/(?:0?[1-9]|1[0-2])(?:\/(?:0?[1-9]|[12]\d|3[01]))?(?:\/page\/\d+)?\/?(?:[?#].*)?$/.test(u));
   if (calendar.length >= 50)
     findings.push({
       pattern: "Date-based archive paths (/YYYY/MM/…)",
@@ -149,6 +147,7 @@ export interface RedirectEntry {
   source: string;
   finalDestination: string;
   hops: number;
+  sourceStatus: number;
 }
 
 export function buildRedirectMap(rows: CrawlRow[]): RedirectEntry[] {
@@ -167,7 +166,9 @@ export function buildRedirectMap(rows: CrawlRow[]): RedirectEntry[] {
       cur = next.redirectUrl;
       hops++;
     }
-    entries.push({ source: r.url, finalDestination: cur, hops });
+    const destination = byUrl.get(cur);
+    if (destination && destination.statusCode >= 400) continue;
+    entries.push({ source: r.url, finalDestination: cur, hops, sourceStatus: r.statusCode });
   }
   return entries;
 }
@@ -182,29 +183,62 @@ function pathOf(u: string): string {
 }
 
 export function redirectMapAsNginx(map: RedirectEntry[]): string {
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return [
-    "# AuditForge collapsed redirect map — every chain resolved to its final destination",
-    ...map.map((e) => `rewrite ^${pathOf(e.source).replace(/[.?+*^$()[\]{}|\\]/g, "\\$&")}$ ${e.finalDestination} permanent;`),
+    "# Review before deployment. Apply each rule only in the source host's HTTP/HTTPS server context.",
+    ...map.map((e) => {
+      const source = new URL(e.source);
+      const destination = new URL(e.finalDestination);
+      const sourcePath = source.pathname + source.search;
+      const query = source.search ? "" : "(?:\\?.*)?";
+      const pattern = `^${escapeRegex(sourcePath)}${query}$`;
+      const status = [301, 302, 303, 307, 308].includes(e.sourceStatus) ? e.sourceStatus : 301;
+      const protocolOnly = source.protocol === "http:" && destination.protocol === "https:" && sourcePath === destination.pathname + destination.search;
+      return [
+        `# ${source.host}: ${sourcePath} -> ${e.finalDestination} (${status})`,
+        protocolOnly ? "# Install this rule in the HTTP server block only; do not include it in HTTPS." : "",
+        `if ($request_uri ~ "${pattern}") { return ${status} ${e.finalDestination}; }`,
+      ].filter(Boolean).join("\n");
+    }),
   ].join("\n");
 }
 
 export function redirectMapAsHtaccess(map: RedirectEntry[]): string {
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return [
-    "# AuditForge collapsed redirect map",
-    ...map.map((e) => `Redirect 301 ${pathOf(e.source)} ${e.finalDestination}`),
+    "# Requires mod_rewrite. Review source host, path and status before deployment.",
+    ...map.map((e) => {
+      const source = new URL(e.source);
+      const sourcePath = escapeRegex(source.pathname.replace(/^\//, ""));
+      const query = escapeRegex(source.search.slice(1));
+      const status = [301, 302, 303, 307, 308].includes(e.sourceStatus) ? e.sourceStatus : 301;
+      return [
+        `# ${source.host}: ${source.pathname}${source.search} -> ${e.finalDestination}`,
+        `RewriteCond %{QUERY_STRING} ^${query}$`,
+        `RewriteRule ^${sourcePath}$ ${e.finalDestination} [R=${status},L,QSD]`,
+      ].join("\n");
+    }),
   ].join("\n");
 }
 
 export function redirectMapAsNextConfig(map: RedirectEntry[]): string {
   const items = map
     .map(
-      (e) =>
-        `    { source: ${JSON.stringify(pathOf(e.source).split("?")[0])}, destination: ${JSON.stringify(
-          e.finalDestination
-        )}, permanent: true },`
+      (e) => {
+        const source = new URL(e.source);
+        const has = [...source.searchParams.entries()].map(([key, value]) =>
+          `      { type: "query", key: ${JSON.stringify(key)}, value: ${JSON.stringify(value)} },`
+        );
+        const permanent = e.sourceStatus === 301 || e.sourceStatus === 308;
+        return [
+          `    { source: ${JSON.stringify(source.pathname)}, destination: ${JSON.stringify(e.finalDestination)}, permanent: ${permanent},`,
+          ...(has.length ? [`      has: [`, ...has, `      ],`] : []),
+          `    },`,
+        ].join("\n");
+      }
     )
     .join("\n");
-  return `// next.config.js — AuditForge collapsed redirect map\nmodule.exports = {\n  async redirects() {\n    return [\n${items}\n    ];\n  },\n};\n`;
+  return `// Review source hosts, destination status and query matching before deployment.\nmodule.exports = {\n  async redirects() {\n    return [\n${items}\n    ];\n  },\n};\n`;
 }
 
 export function issuesAsJiraCsv(issues: Issue[]): string {

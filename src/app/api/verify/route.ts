@@ -4,6 +4,8 @@ import { checkRobots, parseRobotsTxt, RobotsGroup } from "@/lib/robots";
 import { startMeter } from "@/lib/cpu-meter";
 import {
   HeaderFinding,
+  LinkPosition,
+  LiveLink,
   VerifyCheck,
   VerifyMeter,
   VerifyRequestSchema,
@@ -14,7 +16,7 @@ import { isConcatenatedUrl } from "@/lib/url-utils";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const UA = "Mozilla/5.0 (compatible; AuditForgeBot/1.0; SEO audit verification)";
+const UA = process.env.VERIFY_USER_AGENT || "Mozilla/5.0 (compatible; AuditForgeBot/1.0; SEO audit verification)";
 const FETCH_TIMEOUT_MS = 10_000;
 const RETRY_TIMEOUT_MS = 6_000;
 const MAX_HOPS = 5;
@@ -53,7 +55,9 @@ const MAX_LINKS_PER_PAGE = 150;
 type Capability = "status" | "head" | "dom" | "text";
 
 const RULE_CAPS: Record<string, Capability> = {
-  "http-4xx": "status",
+  // A repaired 4xx may now return a 200 challenge page, so read <head> to
+  // distinguish a real resolution from a WAF interstitial.
+  "http-4xx": "head",
   "http-5xx": "status",
   "redirect-302": "status",
   "redirect-chain": "status",
@@ -62,6 +66,7 @@ const RULE_CAPS: Record<string, Capability> = {
   "slow-response": "status",
   "malformed-concatenated-url": "status",
   "link-jump-check": "status",
+  "full-site-url-check": "status",
   "orphan-in-crawl": "status",
   "deep-page": "status",
 
@@ -114,6 +119,22 @@ const RULE_CAPS: Record<string, Capability> = {
   "h2-multiple": "text",
   "no-internal-outlinks": "text",
 };
+
+const CONTENT_RULES = new Set([
+  "title-missing", "title-long", "title-short", "title-duplicate",
+  "meta-missing", "meta-long", "meta-short", "meta-duplicate",
+  "h1-missing", "h1-multiple", "h1-duplicate", "h1-long",
+  "h2-missing", "h2-multiple", "h2-duplicate", "h2-long",
+  "canonical-missing", "canonical-noindex-conflict", "canonicalised",
+  "noindex-with-inlinks", "blocked-with-inlinks", "nofollow-directive", "thin-content",
+]);
+
+const CRAWL_ONLY_RULES = new Set([
+  "orphan-in-crawl", "deep-page", "url-contains-space", "url-non-ascii", "url-too-long",
+  "title-pixels-long", "title-pixels-short", "meta-pixels-long", "meta-pixels-short",
+  "readability-difficult", "readability-very-difficult", "title-duplicate", "meta-duplicate",
+  "h1-duplicate", "h2-duplicate", "canonical-to-non-200",
+]);
 
 /** H2 text content, recovered by regex the same way the h2-missing check reads the document. */
 function h2Texts(html: string): string[] {
@@ -251,7 +272,13 @@ async function readBody(res: Response, cap: Capability): Promise<string> {
 
   const limit = cap === "head" ? MAX_HEAD_BYTES : MAX_HTML_BYTES;
   const reader = res.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: false });
+  const charset = res.headers.get("content-type")?.match(/charset\s*=\s*["']?([^;\s"']+)/i)?.[1] ?? "utf-8";
+  let decoder: TextDecoder;
+  try {
+    decoder = new TextDecoder(charset, { fatal: false });
+  } catch {
+    decoder = new TextDecoder("utf-8", { fatal: false });
+  }
   let out = "";
   let bytes = 0;
 
@@ -276,11 +303,13 @@ async function readBody(res: Response, cap: Capability): Promise<string> {
   return out;
 }
 
-interface LiveState {
+export interface LiveState {
   finalUrl: string;
   finalStatus: number;
   chain: string[];
-  /** True when the redirect chain was still going at MAX_HOPS — a real loop. */
+  /** Repeated canonical URL was observed in the live redirect chain. */
+  redirectLoopDetected: boolean;
+  /** More redirects existed than the verifier was willing to follow. */
   hopLimitHit: boolean;
   html: string;
   headers: Headers;
@@ -288,12 +317,13 @@ interface LiveState {
   title: string;
   metaDescription: string;
   metaRobots: string;
+  metaRobotsTag: string;
   canonical: string;
   canonicalRawLine: string;
   h1s: string[];
   mixedContentCount: number;
   hasJsonLd: boolean;
-  internalLinks: string[];
+  internalLinks: LiveLink[];
   responseMs: number;
 }
 
@@ -302,6 +332,7 @@ function emptyExtraction(): Pick<
   | "title"
   | "metaDescription"
   | "metaRobots"
+  | "metaRobotsTag"
   | "canonical"
   | "canonicalRawLine"
   | "h1s"
@@ -313,6 +344,7 @@ function emptyExtraction(): Pick<
     title: "",
     metaDescription: "",
     metaRobots: "",
+    metaRobotsTag: "",
     canonical: "",
     canonicalRawLine: "",
     h1s: [],
@@ -322,29 +354,118 @@ function emptyExtraction(): Pick<
   };
 }
 
-function extractLinks(root: HTMLElement, currentUrl: string): string[] {
-  const links: string[] = [];
+/** Landmark ancestors, most specific first, mapped to the SF position vocabulary. */
+const LANDMARKS: { selector: (el: HTMLElement) => boolean; position: LinkPosition }[] = [
+  { selector: (el) => el.rawTagName?.toLowerCase() === "nav", position: "Navigation" },
+  { selector: (el) => el.rawTagName?.toLowerCase() === "footer", position: "Footer" },
+  { selector: (el) => el.rawTagName?.toLowerCase() === "header", position: "Header" },
+  { selector: (el) => el.rawTagName?.toLowerCase() === "aside", position: "Aside" },
+  { selector: (el) => el.rawTagName?.toLowerCase() === "main", position: "Content" },
+  { selector: (el) => el.rawTagName?.toLowerCase() === "article", position: "Content" },
+];
+
+/**
+ * Where in the page this element sits.
+ *
+ * Walks up to the nearest landmark, checking ARIA roles and the usual class/id
+ * conventions on the way, because plenty of real templates use `<div id="footer">`
+ * rather than `<footer>`. Mirrors Screaming Frog's Link Position vocabulary so
+ * crawl-sourced and live-sourced links can be counted together.
+ */
+function linkPositionOf(el: HTMLElement): LinkPosition {
+  let node: HTMLElement | null = el;
+  let depth = 0;
+  while (node && depth < 30) {
+    // Head elements (canonical, hreflang alternates) have no page area. Letting
+    // them fall through to the Content default would inflate the Content bucket
+    // in the fix-by-template view, which is meant to mean "someone has to go
+    // edit a page", not "a tag in the document head".
+    if (node.rawTagName?.toLowerCase() === "head") return "Unknown";
+    const role = node.getAttribute?.("role")?.toLowerCase() ?? "";
+    if (role === "navigation") return "Navigation";
+    if (role === "contentinfo") return "Footer";
+    if (role === "banner") return "Header";
+    if (role === "complementary") return "Aside";
+    if (role === "main") return "Content";
+
+    for (const l of LANDMARKS) {
+      if (l.selector(node)) return l.position;
+    }
+
+    const hint = `${node.getAttribute?.("id") ?? ""} ${node.getAttribute?.("class") ?? ""}`.toLowerCase();
+    if (/\b(nav|navbar|menu|topnav|mainnav)\b/.test(hint)) return "Navigation";
+    if (/\b(footer|site-footer|colophon)\b/.test(hint)) return "Footer";
+    if (/\b(header|masthead|site-header)\b/.test(hint)) return "Header";
+    if (/\b(sidebar|widget-area)\b/.test(hint)) return "Sidebar";
+
+    node = node.parentNode as HTMLElement | null;
+    depth++;
+  }
+  return "Content";
+}
+
+/** Every element type that can point at a URL, with the SF type name for each. */
+const LINK_SOURCES: { selector: string; attr: string; type: string }[] = [
+  { selector: "a[href]", attr: "href", type: "Hyperlink" },
+  { selector: "img[src]", attr: "src", type: "Image" },
+  { selector: "iframe[src]", attr: "src", type: "Iframe" },
+  { selector: 'link[rel="canonical"]', attr: "href", type: "Canonical" },
+  { selector: "link[hreflang]", attr: "href", type: "Hreflang" },
+  { selector: "form[action]", attr: "action", type: "Form Action" },
+  { selector: "source[src]", attr: "src", type: "Media" },
+];
+
+/**
+ * Harvest same-origin links from a parsed page, WITH their source-code context.
+ *
+ * This is the only point in the pipeline where the *linking* page is in hand —
+ * /api/verify otherwise fetches the broken URL itself, which can prove a URL is
+ * still 404 but can never show where the link to it lives. Returning bare URL
+ * strings (the previous behaviour) threw that away at the one moment it was free.
+ *
+ * The widened selector list matters as much as the snippet: broken images,
+ * canonicals pointing at dead URLs and hreflang alternates are exactly the edges
+ * a hyperlink-only harvest misses, and they are the ones users report as "a 404
+ * with no source".
+ */
+function extractLinks(root: HTMLElement, currentUrl: string): LiveLink[] {
+  const links: LiveLink[] = [];
   const seen = new Set<string>();
   const pageOrigin = new URL(currentUrl).origin;
-  for (const a of root.querySelectorAll("a[href]")) {
-    const href = a.getAttribute("href");
-    if (!href || href.startsWith("#") || /^(mailto:|tel:|javascript:|data:)/i.test(href)) continue;
-    try {
-      const abs = new URL(href, currentUrl);
-      abs.hash = "";
-      const str = abs.toString();
-      // Concatenated blobs (broken href markup) have their own detection rule —
-      // chasing them via link jump would re-create the giant-URL findings this
-      // pipeline is meant to keep readable.
-      if (isConcatenatedUrl(str)) continue;
-      if (abs.origin === pageOrigin && !seen.has(str)) {
-        seen.add(str);
-        links.push(str);
+
+  for (const src of LINK_SOURCES) {
+    for (const el of root.querySelectorAll(src.selector)) {
+      if (links.length >= MAX_LINKS_PER_PAGE) return links;
+      const raw = el.getAttribute(src.attr);
+      if (!raw || raw.startsWith("#") || /^(mailto:|tel:|javascript:|data:)/i.test(raw)) continue;
+      try {
+        const abs = new URL(raw, currentUrl);
+        abs.hash = "";
+        const str = abs.toString();
+        // Concatenated blobs (broken href markup) have their own detection rule —
+        // chasing them via link jump would re-create the giant-URL findings this
+        // pipeline is meant to keep readable.
+        if (isConcatenatedUrl(str)) continue;
+        if (abs.origin !== pageOrigin) continue;
+        const key = `${src.type}|${str}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const rel = el.getAttribute("rel") ?? undefined;
+        links.push({
+          url: str,
+          anchor: (el.text ?? "").trim().slice(0, 120) || (el.getAttribute("alt") ?? "").trim().slice(0, 120),
+          // Truncated: a ticket needs the tag, not the subtree under it.
+          snippet: (el.outerHTML ?? "").replace(/\s+/g, " ").slice(0, 300),
+          position: linkPositionOf(el),
+          linkType: src.type,
+          rel,
+          follow: rel ? !/\bnofollow\b/i.test(rel) : undefined,
+        });
+      } catch {
+        /* malformed href */
       }
-    } catch {
-      /* malformed href */
     }
-    if (links.length >= MAX_LINKS_PER_PAGE) break;
   }
   return links;
 }
@@ -352,21 +473,28 @@ function extractLinks(root: HTMLElement, currentUrl: string): string[] {
 /**
  * One fetch, one parse, everything the page's rules need.
  *
- * Redirect handling no longer throws at the hop limit: a genuine redirect loop
- * used to blow up here and land in UNVERIFIABLE, which meant the `redirect-loop`
- * rule could never actually confirm. Now we stop, flag `hopLimitHit`, and let
- * classify() call it what it is.
+ * Redirect handling stops on an observed repeated URL or at a bounded hop limit.
+ * A long chain is not assumed to be a loop.
  */
 async function fetchLive(url: string, cap: Capability, collectLinks: boolean): Promise<LiveState> {
   const attempt = async (timeoutMs: number): Promise<LiveState> => {
     const chain: string[] = [];
     let current = url;
     let res: Response | null = null;
+    let redirectLoopDetected = false;
     let hopLimitHit = false;
-    const started = Date.now();
+    let responseMs = 0;
+    const redirectKey = (value: string) => {
+      const parsed = new URL(value);
+      parsed.hash = "";
+      return parsed.href;
+    };
+    const visited = new Set([redirectKey(url)]);
 
     for (let hop = 0; hop <= MAX_HOPS; hop++) {
+      const requestStarted = Date.now();
       res = await fetchWithTimeout(current, timeoutMs);
+      responseMs = Date.now() - requestStarted;
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get("location");
         if (!loc) break;
@@ -378,10 +506,16 @@ async function fetchLive(url: string, cap: Capability, collectLinks: boolean): P
         }
         chain.push(`${res.status} → ${next}`);
         await res.body?.cancel().catch(() => undefined);
+        if (visited.has(redirectKey(next))) {
+          redirectLoopDetected = true;
+          current = next;
+          break;
+        }
         if (hop === MAX_HOPS) {
           hopLimitHit = true;
           break;
         }
+        visited.add(redirectKey(next));
         current = next;
         continue;
       }
@@ -389,7 +523,6 @@ async function fetchLive(url: string, cap: Capability, collectLinks: boolean): P
     }
     if (!res) throw new Error("No response");
 
-    const responseMs = Date.now() - started;
     const contentType = res.headers.get("content-type") ?? "";
     const isMarkup = /html|xml/i.test(contentType);
     // Non-markup responses (PDF, image, JSON) have nothing our rules can read.
@@ -400,6 +533,7 @@ async function fetchLive(url: string, cap: Capability, collectLinks: boolean): P
       finalUrl: current,
       finalStatus: res.status,
       chain,
+      redirectLoopDetected,
       hopLimitHit,
       html,
       headers: res.headers,
@@ -419,7 +553,8 @@ async function fetchLive(url: string, cap: Capability, collectLinks: boolean): P
     base.title = root.querySelector("title")?.text.trim() ?? "";
     base.metaDescription =
       root.querySelector('meta[name="description" i]')?.getAttribute("content")?.trim() ?? "";
-    base.metaRobots = root.querySelector('meta[name="robots" i]')?.getAttribute("content") ?? "";
+    base.metaRobotsTag = root.querySelector('meta[name="robots" i]')?.getAttribute("content") ?? "";
+    base.metaRobots = [base.metaRobotsTag, res.headers.get("x-robots-tag") ?? ""].filter(Boolean).join(", ");
     base.canonical = root.querySelector('link[rel="canonical"]')?.getAttribute("href")?.trim() ?? "";
     base.canonicalRawLine = html.match(/<link[^>]*rel=["']canonical["'][^>]*>/i)?.[0] ?? "";
     base.hasJsonLd = root.querySelectorAll('script[type="application/ld+json"]').length > 0;
@@ -466,6 +601,29 @@ function auditHeaders(url: string, headers: Headers, metaRobots: string): Header
         : { url, check: "HSTS", grade: "warn", detail: "No Strict-Transport-Security header" }
     );
   }
+  const csp = get("content-security-policy");
+  findings.push(
+    csp
+      ? { url, check: "Content-Security-Policy", grade: "pass", detail: csp }
+      : { url, check: "Content-Security-Policy", grade: "warn", detail: "No Content-Security-Policy header" }
+  );
+  findings.push(
+    /\bnosniff\b/i.test(get("x-content-type-options"))
+      ? { url, check: "X-Content-Type-Options", grade: "pass", detail: get("x-content-type-options") }
+      : { url, check: "X-Content-Type-Options", grade: "warn", detail: "Missing nosniff directive" }
+  );
+  const framePolicy = get("x-frame-options");
+  findings.push(
+    framePolicy || /frame-ancestors\s+[^;]+/i.test(csp)
+      ? { url, check: "Clickjacking protection", grade: "pass", detail: framePolicy || csp.match(/frame-ancestors\s+[^;]+/i)?.[0] || "CSP frame-ancestors" }
+      : { url, check: "Clickjacking protection", grade: "warn", detail: "No X-Frame-Options or CSP frame-ancestors policy" }
+  );
+  const referrerPolicy = get("referrer-policy");
+  findings.push(
+    /^(no-referrer|same-origin|strict-origin|strict-origin-when-cross-origin)$/i.test(referrerPolicy)
+      ? { url, check: "Referrer-Policy", grade: "pass", detail: referrerPolicy }
+      : { url, check: "Referrer-Policy", grade: "warn", detail: referrerPolicy || "No Referrer-Policy header" }
+  );
   const xRobots = get("x-robots-tag");
   if (xRobots) {
     const headerNoindex = /noindex/i.test(xRobots);
@@ -503,13 +661,35 @@ function classify(
   ruleId: string,
   crawlEvidence: string,
   live: LiveState
-): { status: "CONFIRMED" | "RESOLVED"; liveEvidence: string } {
+): { status: "CONFIRMED" | "RESOLVED" | "UNVERIFIABLE"; liveEvidence: string } {
   const confirmed = (ev: string) => ({ status: "CONFIRMED" as const, liveEvidence: ev });
   const resolved = (ev: string) => ({ status: "RESOLVED" as const, liveEvidence: ev });
+  const unverifiable = (ev: string) => ({ status: "UNVERIFIABLE" as const, liveEvidence: ev });
   const s = live.finalStatus;
   const redirected = live.chain.length > 0;
 
+  if ([401, 403, 429].includes(s) || live.headers.has("cf-mitigated")) {
+    return unverifiable(`Live fetch was blocked or rate-limited (HTTP ${s}); verify from an authorized crawl environment.`);
+  }
+  if (/captcha|verify you are human|checking your browser|bot detection|access denied/i.test(live.html)) {
+    return unverifiable("Live response appears to be a bot challenge; no SEO verdict was inferred.");
+  }
+  if (CONTENT_RULES.has(ruleId)) {
+    const contentType = live.headers.get("content-type") ?? "";
+    if (s !== 200 || !/text\/html|application\/xhtml\+xml/i.test(contentType) || !live.html) {
+      return unverifiable(`Live response was HTTP ${s} with content type "${contentType || "unknown"}", not a readable HTML page.`);
+    }
+  }
+  if (CRAWL_ONLY_RULES.has(ruleId)) {
+    return unverifiable("This finding depends on crawl-wide or Screaming Frog-only data and cannot be independently re-measured from one live fetch.");
+  }
+
   switch (ruleId) {
+    case "full-site-url-check": {
+      const crawlStatus = Number.parseInt(crawlEvidence.match(/HTTP\s+(\d{3})/i)?.[1] ?? "0", 10);
+      const redirectNote = redirected ? `; redirect chain: ${live.chain.join(" | ")}` : "";
+      return confirmed(`Live HTTP ${s}; crawl HTTP ${crawlStatus}${redirectNote}`);
+    }
     case "http-4xx":
       return s >= 400 && s < 500
         ? confirmed(`Live fetch: HTTP ${s}`)
@@ -526,8 +706,10 @@ function classify(
         ? confirmed(`Live chain (${live.chain.length} hops): ${live.chain.join(" ")}`)
         : resolved(redirected ? `Single hop now: ${live.chain[0]}` : `No longer redirects (HTTP ${s})`);
     case "redirect-loop":
-      return live.hopLimitHit || live.chain.length >= MAX_HOPS
+      return live.redirectLoopDetected
         ? confirmed(`Still chaining past ${MAX_HOPS} hops: ${live.chain.slice(0, 3).join(" ")}…`)
+        : live.hopLimitHit
+          ? unverifiable(`Redirect chain exceeded ${MAX_HOPS} hops without repeating a URL.`)
         : resolved(`Chain now resolves: ${live.chain.join(" ") || `HTTP ${s}`}`);
     case "redirect-broken-target":
       return redirected && s >= 400
@@ -542,7 +724,7 @@ function classify(
         ? confirmed(`Live title, ${live.title.length} chars: "${live.title.slice(0, 90)}"`)
         : resolved(`Live title now ${live.title.length} chars`);
     case "title-short":
-      return live.title.length > 0 && live.title.length < 20
+      return live.title.length > 0 && live.title.length < 30
         ? confirmed(`Live title, ${live.title.length} chars: "${live.title}"`)
         : resolved(`Live title now ${live.title.length} chars`);
     case "title-duplicate":
@@ -554,7 +736,7 @@ function classify(
         ? confirmed("Live source: no meta description")
         : resolved(`Live meta description present (${live.metaDescription.length} chars)`);
     case "meta-long":
-      return live.metaDescription.length > 160
+      return live.metaDescription.length > 155
         ? confirmed(`Live meta description ${live.metaDescription.length} chars`)
         : resolved(`Now ${live.metaDescription.length} chars`);
     case "meta-duplicate":
@@ -588,6 +770,7 @@ function classify(
         : resolved(`Live signals: canonical="${live.canonical}", robots="${live.metaRobots || "(none)"}"`);
     }
     case "canonical-to-non-200":
+      return unverifiable("The canonical target's current status is not available from this page fetch.");
     case "canonicalised":
       return live.canonical !== "" && live.canonical.replace(/\/$/, "") !== live.finalUrl.replace(/\/$/, "")
         ? confirmed(`Live: ${live.canonicalRawLine || `canonical → ${live.canonical}`}`)
@@ -602,7 +785,12 @@ function classify(
         ? confirmed(`Live fetch took ${(live.responseMs / 1000).toFixed(2)}s`)
         : resolved(`Live fetch took ${(live.responseMs / 1000).toFixed(2)}s`);
     case "thin-content": {
-      const text = live.html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/g, " ");
+      const root = parseHtml(live.html);
+      for (const selector of ["script", "style", "nav", "header", "footer", "aside", "noscript", "template"]) {
+        for (const el of root.querySelectorAll(selector)) el.remove();
+      }
+      const main = root.querySelector("main, article, [role=main]") ?? root.querySelector("body") ?? root;
+      const text = main.text.replace(/\s+/g, " ");
       const words = text.split(/\s+/).filter(Boolean).length;
       return words < 150 ? confirmed(`Live body ≈ ${words} words`) : resolved(`Live body ≈ ${words} words`);
     }
@@ -669,7 +857,10 @@ function classify(
     }
     case "oversized-resource": {
       const len = parseInt(live.headers.get("content-length") ?? "", 10);
-      if (!Number.isFinite(len)) return confirmed(`No Content-Length on the live response; crawl measured: ${crawlEvidence}`);
+      if (!Number.isFinite(len)) return unverifiable(`No Content-Length on the live response; crawl measured: ${crawlEvidence}`);
+      if (live.headers.has("content-encoding") && len <= 2 * 1024 * 1024) {
+        return unverifiable("The live Content-Length is compressed transfer size, so it cannot confirm the uncompressed resource size.");
+      }
       return len > 2 * 1024 * 1024
         ? confirmed(`Live Content-Length ${(len / 1024 / 1024).toFixed(2)}MB`)
         : resolved(`Live Content-Length now ${(len / 1024 / 1024).toFixed(2)}MB`);
@@ -679,11 +870,7 @@ function classify(
         ? confirmed(`Live fetch: HTTP ${s} — this URL was discovered in another page's live source, not in the crawl`)
         : resolved(`Live fetch: HTTP ${s}${redirected ? ` via ${live.chain.join(" ")}` : ""}`);
     default:
-      // Rules verified structurally (orphans, depth) can't change via a single live fetch:
-      // confirm that the page is still live, keep the crawl evidence.
-      return s === 200
-        ? confirmed(`Page live (HTTP 200); structural finding from crawl stands: ${crawlEvidence}`)
-        : resolved(`Page no longer returns 200 (now ${s}); re-crawl to reassess`);
+      return unverifiable(`No live verification adapter exists for this finding (current HTTP ${s}).`);
   }
 }
 
@@ -720,7 +907,8 @@ export async function POST(req: NextRequest) {
 
   for (let p = 0; p < pages.length; p++) {
     const page = pages[p];
-    const cap = capabilityFor(page.checks, collectLinks);
+    const pageCollectLinks = collectLinks || page.collectLinks === true;
+    const cap = capabilityFor(page.checks, pageCollectLinks);
 
     try {
       const parsedUrl = new URL(page.url);
@@ -740,11 +928,11 @@ export async function POST(req: NextRequest) {
       }
 
       // ── One fetch. One parse. Every rule on this URL classified from it. ──
-      const live = await fetchLive(page.url, cap, collectLinks);
+      const live = await fetchLive(page.url, cap, pageCollectLinks);
       if (live.cap === "status") counters.bodySkipped++;
       else if (live.cap === "head") counters.headOnly++;
 
-      const headerFindings = collectHeaders ? auditHeaders(page.url, live.headers, live.metaRobots) : undefined;
+      const headerFindings = collectHeaders ? auditHeaders(page.url, live.headers, live.metaRobotsTag) : undefined;
 
       for (const [idx, check] of page.checks.entries()) {
         const { status, liveEvidence } = classify(check.ruleId, check.crawlEvidence, live);
@@ -766,7 +954,11 @@ export async function POST(req: NextRequest) {
     } catch (e) {
       const message = e instanceof Error ? e.message : "Fetch failed";
       for (const check of page.checks) {
-        results.push({ issueId: check.issueId, status: "UNVERIFIABLE", liveEvidence: "", verifyError: message });
+        results.push(
+          check.ruleId === "no-response"
+            ? { issueId: check.issueId, status: "CONFIRMED", liveEvidence: `No HTTP response after retry: ${message}` }
+            : { issueId: check.issueId, status: "UNVERIFIABLE", liveEvidence: "", verifyError: message }
+        );
       }
     }
 

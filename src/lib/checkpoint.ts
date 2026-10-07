@@ -1,5 +1,5 @@
 "use client";
-import { AuditState, VerifyResultItem } from "@/lib/schema";
+import { AuditState, LiveLink, VerifyResultItem } from "@/lib/schema";
 
 /**
  * Durable client-side state: verification checkpoints and finished audits.
@@ -31,7 +31,7 @@ export interface VerifyCheckpoint {
   /** Results collected so far, keyed by issueId. */
   results: Record<string, VerifyResultItem>;
   /** Same-origin links harvested from live HTML, for the link-jump pass. */
-  linksBySource: Record<string, string[]>;
+  linksBySource: Record<string, LiveLink[]>;
   /** Active CPU this run has spent so far, in ms. */
   runCpuMs: number;
 }

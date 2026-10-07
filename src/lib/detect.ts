@@ -1,4 +1,4 @@
-import { ABSENT_SCORE, CrawlRow, Issue, Owner, Severity } from "./schema";
+import { ABSENT_SCORE, CrawlRow, InlinkEdge, Issue, Owner, Severity } from "./schema";
 import { isConcatenatedUrl, splitConcatenatedUrls } from "./url-utils";
 
 interface RuleDef {
@@ -22,6 +22,8 @@ export interface DetectContext {
   metaCounts: Map<string, number>;
   h1Counts: Map<string, number>;
   h2Counts: Map<string, number>;
+  uniqueInlinks?: Map<string, number>;
+  uniqueInternalOutlinks?: Map<string, number>;
   isHtml: (r: CrawlRow) => boolean;
 }
 
@@ -98,11 +100,11 @@ export const RULES: RuleDef[] = [
     owner: "Dev",
     test: (r, ctx) => {
       if (!(r.statusCode >= 300 && r.statusCode < 400) || !r.redirectUrl) return null;
-      const seen = new Set<string>([norm(r.url)]);
+      const seen = new Set<string>([r.url]);
       let cur = r.redirectUrl;
       for (let hop = 0; hop < 6; hop++) {
-        if (seen.has(norm(cur))) return `Loop detected via ${cur}`;
-        seen.add(norm(cur));
+        if (seen.has(cur)) return `Loop detected via ${cur}`;
+        seen.add(cur);
         const next = ctx.byUrl.get(cur);
         if (!next || !(next.statusCode >= 300 && next.statusCode < 400) || !next.redirectUrl) return null;
         cur = next.redirectUrl;
@@ -148,11 +150,11 @@ export const RULES: RuleDef[] = [
   },
   {
     id: "title-short",
-    label: "Title too short (< 20 chars)",
+    label: "Title too short (< 30 chars)",
     severity: "Low",
     owner: "Content",
     test: (r, ctx) =>
-      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) && r.title && r.titleLength < 20
+      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) && r.title && r.titleLength < 30
         ? `${r.titleLength} chars: "${r.title}"`
         : null,
   },
@@ -177,10 +179,10 @@ export const RULES: RuleDef[] = [
   },
   {
     id: "meta-long",
-    label: "Meta description too long (> 160 chars)",
+    label: "Meta description too long (> 155 chars)",
     severity: "Low",
     owner: "Content",
-    test: (r, ctx) => (ctx.isHtml(r) && r.statusCode === 200 && r.metaLength > 160 ? `${r.metaLength} chars` : null),
+    test: (r, ctx) => (ctx.isHtml(r) && r.statusCode === 200 && r.metaLength > 155 ? `${r.metaLength} chars` : null),
   },
   {
     id: "h1-missing",
@@ -252,8 +254,8 @@ export const RULES: RuleDef[] = [
     severity: "High",
     owner: "SEO",
     test: (r, ctx) =>
-      ctx.isHtml(r) && r.statusCode === 200 && isNoindex(r) && r.inlinks >= 5
-        ? `noindex (${r.metaRobots || r.indexabilityStatus}) with ${r.inlinks} inlinks`
+      ctx.isHtml(r) && r.statusCode === 200 && isNoindex(r) && (ctx.uniqueInlinks?.get(r.url) ?? r.inlinks) >= 5
+        ? `noindex (${r.metaRobots || r.indexabilityStatus}) with ${ctx.uniqueInlinks?.get(r.url) ?? r.inlinks} unique inlinks`
         : null,
   },
   {
@@ -261,9 +263,9 @@ export const RULES: RuleDef[] = [
     label: "Blocked by robots.txt but receiving internal links",
     severity: "Medium",
     owner: "SEO",
-    test: (r) =>
-      /blocked by robots/i.test(r.indexabilityStatus) && r.inlinks >= 3
-        ? `${r.indexabilityStatus}, ${r.inlinks} inlinks`
+    test: (r, ctx) =>
+      /blocked by robots/i.test(r.indexabilityStatus) && (ctx.uniqueInlinks?.get(r.url) ?? r.inlinks) >= 3
+        ? `${r.indexabilityStatus}, ${ctx.uniqueInlinks?.get(r.url) ?? r.inlinks} unique inlinks`
         : null,
   },
   {
@@ -272,7 +274,7 @@ export const RULES: RuleDef[] = [
     severity: "Medium",
     owner: "SEO",
     test: (r, ctx) =>
-      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) && r.inlinks === 0 && r.crawlDepth > 0
+      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) && (ctx.uniqueInlinks?.get(r.url) ?? r.inlinks) === 0 && r.crawlDepth > 0
         ? "0 internal inlinks (reachable only via sitemap/start URL)"
         : null,
   },
@@ -345,8 +347,9 @@ export const RULES: RuleDef[] = [
     severity: "Medium",
     owner: "SEO",
     test: (r, ctx) =>
-      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) && r.outlinks === 0
-        ? `0 internal outlinks — link equity arrives (${r.inlinks} inlinks) and stops here`
+      ctx.isHtml(r) && r.statusCode === 200 && isIndexable(r) &&
+      (ctx.uniqueInternalOutlinks?.get(r.url) ?? (r.outlinks === 0 ? 0 : 1)) === 0
+        ? `0 unique internal outlinks — link equity arrives (${ctx.uniqueInlinks?.get(r.url) ?? r.inlinks} inlinks) and stops here`
         : null,
   },
   {
@@ -528,6 +531,8 @@ export interface DetectOptions {
    * to keep every page on the cheap <head> fetch tier.
    */
   extendedContentRules?: boolean;
+  /** Optional All Inlinks graph enables exact unique same-origin link counts. */
+  inlinkEdges?: InlinkEdge[];
 }
 
 /** URLs these rules add at the full-document fetch tier — the cost of parity. */
@@ -541,6 +546,18 @@ export function detectIssues(rows: CrawlRow[], opts: DetectOptions = {}): Issue[
   const metaCounts = new Map<string, number>();
   const h1Counts = new Map<string, number>();
   const h2Counts = new Map<string, number>();
+  const incomingSources = opts.inlinkEdges ? new Map(rows.map((r) => [r.url, new Set<string>()])) : undefined;
+  const outgoingTargets = opts.inlinkEdges ? new Map(rows.map((r) => [r.url, new Set<string>()])) : undefined;
+  for (const edge of opts.inlinkEdges ?? []) {
+    if (edge.linkType && !/hyperlink/i.test(edge.linkType)) continue;
+    try {
+      if (new URL(edge.source).origin !== new URL(edge.target).origin) continue;
+      incomingSources?.get(edge.target)?.add(edge.source);
+      outgoingTargets?.get(edge.source)?.add(edge.target);
+    } catch {
+      /* ignore malformed link edges */
+    }
+  }
   const isHtml = (r: CrawlRow) => r.contentType === "" || /html/i.test(r.contentType);
 
   for (const r of rows) {
@@ -552,7 +569,16 @@ export function detectIssues(rows: CrawlRow[], opts: DetectOptions = {}): Issue[
       if (r.h2) h2Counts.set(r.h2, (h2Counts.get(r.h2) ?? 0) + 1);
     }
   }
-  const ctx: DetectContext = { byUrl, titleCounts, metaCounts, h1Counts, h2Counts, isHtml };
+  const ctx: DetectContext = {
+    byUrl,
+    titleCounts,
+    metaCounts,
+    h1Counts,
+    h2Counts,
+    uniqueInlinks: incomingSources ? new Map([...incomingSources].map(([u, sources]) => [u, sources.size])) : undefined,
+    uniqueInternalOutlinks: outgoingTargets ? new Map([...outgoingTargets].map(([u, targets]) => [u, targets.size])) : undefined,
+    isHtml,
+  };
 
   const issues: Issue[] = [];
   for (const row of rows) {
@@ -564,11 +590,17 @@ export function detectIssues(rows: CrawlRow[], opts: DetectOptions = {}): Issue[
         evidence = null; // a single bad row must never kill detection
       }
       if (evidence) {
+        const severity =
+          rule.id === "http-4xx" && [401, 403, 429].includes(row.statusCode)
+            ? "Medium"
+            : rule.id === "http-4xx" && row.statusCode === 410
+              ? "High"
+              : rule.severity;
         issues.push({
           id: `${rule.id}::${row.url}`,
           ruleId: rule.id,
           ruleLabel: rule.label,
-          severity: rule.severity,
+          severity,
           owner: rule.owner,
           url: row.url,
           evidence,

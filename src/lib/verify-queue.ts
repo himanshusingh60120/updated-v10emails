@@ -4,6 +4,7 @@ import { clearCheckpoint, loadCheckpoint, saveCheckpoint, VerifyCheckpoint } fro
 import {
   HeaderFinding,
   Issue,
+  LiveLink,
   severityRank,
   VerifyMeter,
   VerifyPageRequest,
@@ -69,7 +70,7 @@ export interface QueueStatus {
 export interface VerifyRunResult {
   issues: Issue[];
   headerFindings: HeaderFinding[];
-  linksBySource: Map<string, string[]>;
+  linksBySource: Map<string, LiveLink[]>;
   /** False when the run was stopped, halted by the budget, or capped. */
   complete: boolean;
   verifiedPages: number;
@@ -83,6 +84,8 @@ export interface VerifyQueueOptions {
   budget: CpuBudget;
   /** Harvest same-origin links for the link-jump pass. Forces a full DOM parse. */
   collectLinks?: boolean;
+  /** When supplied, only these URLs receive the full-document link-harvest pass. */
+  collectLinksUrls?: Set<string>;
   /** Hard cap on URLs verified this run. Issues beyond it are marked SKIPPED. */
   maxUrls?: number;
   /** Parallel batches. Defaults to 5 locally, 3 against a billed deployment. */
@@ -146,7 +149,7 @@ export class VerifyQueue {
   private retryQueue: { batch: VerifyPageRequest[]; attempt: number }[] = [];
   private results = new Map<string, VerifyResultItem>();
   private headerFindings: HeaderFinding[] = [];
-  private linksBySource = new Map<string, string[]>();
+  private linksBySource = new Map<string, LiveLink[]>();
   private issuesById = new Map<string, Issue>();
   private pending: VerifyResultItem[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -293,6 +296,9 @@ export class VerifyQueue {
 
     const pages: VerifyPageRequest[] = kept.map((entry) => ({
       url: entry.url,
+      collectLinks: this.opts.collectLinksUrls
+        ? this.opts.collectLinksUrls.has(entry.url)
+        : this.opts.collectLinks ?? false,
       checks: entry.issues.map((i) => ({
         issueId: i.id,
         ruleId: i.ruleId,
@@ -484,7 +490,7 @@ export class VerifyQueue {
         body: JSON.stringify({
           pages: batch,
           delayMs: 0,
-          collectLinks: this.opts.collectLinks ?? false,
+          collectLinks: false,
           collectHeaders: true,
         }),
       });

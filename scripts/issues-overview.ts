@@ -1,4 +1,4 @@
-import { CrawlRow, Issue } from "./schema";
+import { CrawlRow, Issue } from "../src/lib/schema";
 
 /**
  * Screaming Frog's "Issues Overview" export as a second input.

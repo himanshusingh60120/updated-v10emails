@@ -1,8 +1,8 @@
 # AuditForge
 
-**A Screaming Frog audit verification and reporting engine.** Upload a crawl export; AuditForge detects every derivable SEO issue, then — before anything reaches the report — **re-verifies each flagged URL against the live site**, classifying it as `CONFIRMED` (with a source-code evidence snippet), `RESOLVED` (fixed since the crawl), or `UNVERIFIABLE` (with the failure reason, never silently dropped). Confirmed issues are impact-scored, explained by the AI layer, and delivered as a team-ready report with XLSX / Jira CSV / redirect-map / PDF exports.
+**A Screaming Frog audit verification and reporting engine.** Upload a crawl export; AuditForge detects derivable issues and re-checks what one live HTTP fetch can actually prove. Findings are `CONFIRMED`, `RESOLVED`, or `UNVERIFIABLE`; bot challenges, non-HTML responses, crawl-wide comparisons, and metrics that require special exports are not presented as live-confirmed. Confirmed findings can be impact-scored, explained by the AI layer, and delivered as a team-ready report with XLSX / Jira CSV / redirect-map / PDF exports.
 
-> **Accuracy over speed, evidence over assumption: nothing enters the report without surviving the verification loop.**
+> **A live HTTP response is evidence, not omniscience. AuditForge labels the boundary between verified, resolved, and not measurable from this fetch.**
 
 ---
 
@@ -12,19 +12,19 @@
 |---|---|
 | CSV / XLSX ingestion ("Internal: All"), browser-side stream parsing, 50k+ URLs | ✅ first-class |
 | `.dbseospider` best-effort SQLite ingestion → graceful CSV-path fallback message | ✅ |
-| Detection engine: 25 rules (4xx/5xx, redirect chains/loops/302s, titles, metas, H1/H2, canonical conflicts, noindex+inlinks, orphans, depth, thin content, slow responses, **malformed concatenated URLs** — a single crawled address containing multiple URLs mashed together by broken href markup is split into a readable constituent list instead of one giant unreadable 4xx cell) | ✅ |
+| Detection engine: 47 rules (4xx/5xx, redirect chains/loops/302s, titles, metas, H1/H2, canonical conflicts, noindex+inlinks, orphans, depth, thin content, slow responses, URL hygiene and export-gated pixel/readability checks) | ✅ |
 | **Error-source tracing**: every confirmed broken URL is annotated with *where it comes from* — internal pages linking to it (crawl link graph, with anchor text) plus, when GSC is connected, the **URL Inspection API**'s referring pages, sitemaps, and coverage state (capped at 40 inspections/audit to protect the 2,000/day quota). Sources appear in the report, the standalone HTML, the XLSX, and Jira ticket descriptions | ✅ |
-| **Verification loop**: live fetch, UA, ≤5 redirect hops, 10s timeout, 1 retry, robots.txt respected, 300ms delay, batched + concurrency-capped + resumable (client-driven `/api/verify` batches — no serverless timeout can kill a 10k-URL run) | ✅ |
+| **Full-site live status check**: every unique URL in Internal: All gets a status-only fetch; rule-flagged pages share that fetch and receive deeper rule-specific checks. Configurable user agent, ≤5 redirect hops, 10s timeout, robots.txt respected, batched + budget-governed + resumable; 401/403/429 and challenges stay `UNVERIFIABLE` | ✅ |
 | **Link-jump verification**: same-origin links are extracted from the live HTML of every verified page, then (a) cross-checked against the crawl — live pages still linking to known 4xx/5xx URLs become `Live page links to a broken URL` findings — and (b) links *absent from the crawl* are live-checked too (capped at 100/audit); broken ones enter the report as `Broken URL discovered via link jump` | ✅ |
 | **GSC — fully automatic**: one-time "Connect Google Search Console" OAuth, then every audit auto-pulls per-URL clicks/impressions/CTR/position (last 28 days, paginated to 75k URLs) during the Enrich stage. Property auto-matched to the crawl domain, or pick one. Tokens live in an AES-256-GCM-encrypted httpOnly cookie — no database needed. CSV export upload remains as a fallback | ✅ |
 | Module B — Core Web Vitals via PSI API, template-clustered sampling | ✅ |
 | Module C — Sitemap intelligence (index recursion, 3-way diff, lastmod plausibility, size limits) | ✅ |
-| Module D — Internal PageRank, equity leaks, dead-ends, top linking opportunities | ✅ |
+| Module D — Internal PageRank, equity leaks, dead-ends, top linking opportunities; full All Inlinks graph supplies unique internal-link counts. Filtered 4xx Inlinks supplies broken-URL source evidence only and is not treated as a complete PageRank graph | ✅ |
 | Module F — Delta audits (new / fixed / **regressed**, health trend) via previous-audit JSON | ✅ |
 | Module G — Fix tracker: Open → In Progress → Fixed-Claimed → **Fixed-Verified only when live source proves it** (on-demand re-verification; cron recipe below) | ✅ |
 | Module I — URL hygiene (parameter bloat, case/slash/protocol dupes, infinite spaces) + **live robots.txt simulator** | ✅ |
-| Module J — Header audit piggybacked on verification fetches (HSTS, X-Robots-Tag conflicts, compression, cache-control, charset) | ✅ |
-| Module M — Collapsed redirect map (nginx / .htaccess / Next.js) + Jira-importable CSV | ✅ |
+| Module J — Header audit piggybacked on verification fetches (HSTS, CSP, MIME sniffing, clickjacking, referrer policy, X-Robots-Tag conflicts, compression, cache-control, charset) | ✅ |
+| Module M — Status-aware, query-aware collapsed redirect map (nginx / .htaccess / Next.js) + Jira-importable CSV; generated snippets require review before deployment | ✅ |
 | AI layer — batched-by-type explanations, root cause, fix steps + code snippets, effort, owner; executive summary with grade & 30-day plan; **only CONFIRMED issues reach the AI** | ✅ |
 | Report — health dashboard, severity & team tabs, verification log, evidence snippets, full appendix, shareable unguessable-slug links (Vercel KV), print-optimized PDF | ✅ |
 | Engineering bar — TypeScript + Zod on every API boundary, per-module failure isolation with "module skipped" notes, rate limiting, upload validation, localStorage resume | ✅ |
@@ -33,10 +33,27 @@
 
 Being straight with you rather than shipping façades:
 
-- **URL Inspection API + Module E (cannibalization).** GSC OAuth is now fully implemented (see above); these two are the remaining GSC features. Both are now small additions on top of the working OAuth plumbing in `src/lib/gsc-server.ts` — cannibalization needs a second `searchAnalytics/query` call with `dimensions: ["query","page"]`.
+- **Module E (query/page cannibalization).** GSC OAuth and bounded URL Inspection are already implemented; cannibalization needs query-page data, enough impressions to avoid noisy matches, and a time/device/country-aware report rather than a simplistic duplicate-keyword flag.
 - **Module A (raw vs rendered DOM).** `puppeteer-core + @sparticuz/chromium` works on Vercel but pins you to specific function memory/size budgets; it deserves its own queue-isolated route rather than a bolted-on afterthought.
 - **Module H (simhash near-duplicates), Module K (schema validation), Module L (AEO scoring), Slack digest.** Straightforward extensions on top of the existing verification fetch (the HTML is already in hand at that point in `src/app/api/verify/route.ts`).
 - **Server-side PDF.** The report ships a print stylesheet (`⬇ PDF` button → browser print → Save as PDF), which stakeholders can't tell apart from a generated PDF. Headless-Chrome PDF generation belongs with Module A.
+
+## Verification boundaries
+
+- A single fetch cannot independently prove duplicate titles/H1s across pages, crawl depth, orphan status, Screaming Frog pixel widths, or Flesch readability. These remain `UNVERIFIABLE` until a corresponding comparison or measurement is available.
+- Canonical target status is not inferred from the source page. A canonical-to-error finding remains `UNVERIFIABLE` unless the target itself is checked.
+- Thin-content verification prefers `<main>`, `<article>`, or `[role=main]` and excludes common site chrome; it is still a heuristic, not a semantic content-quality judgment.
+- `VERIFY_USER_AGENT` can identify the verifier to a WAF/CDN. Use a permitted agent and only allowlist it on properties you control. A 403/429 is not evidence that the URL is broken.
+- Redirect exports are implementation starting points. Review host context, query behavior, status semantics, and destination health before deploying them.
+
+## Recommended next modules
+
+1. **Rendered DOM parity (highest technical risk reduction):** compare raw and rendered indexability, title/meta/canonical/H1, links, and structured data; report what JavaScript changed. Run it as a separately budgeted sample/queue.
+2. **Structured data and hreflang validation:** parse JSON-LD/Microdata/RDFa; separate syntax errors from Google rich-result eligibility; validate reciprocal hreflang, language-region codes, canonical/indexable targets, and `x-default`.
+3. **GSC opportunity and cannibalization analysis:** query-to-page overlap, declining clicks, high-impression/low-CTR pages, and branded/non-branded segmentation with minimum sample thresholds.
+4. **Image and media audit:** missing/empty/duplicate alt, image dimensions, modern formats, byte size, broken image sources, and likely LCP images, grouped by template.
+5. **Pagination and faceted navigation:** discover `rel=next`/pagination patterns and parameter families, then reconcile crawlability, canonical/noindex, internal links, sitemap inclusion, and GSC demand.
+6. **Log-file analysis and migration monitoring:** combine bot request logs with crawl/GSC data to find wasted crawl budget, orphaned-but-crawled URLs, redirect misses, and post-release regressions.
 
 ---
 
@@ -77,7 +94,7 @@ auditforge/
     └── lib/
         ├── schema.ts                ← Zod schemas & shared types (the internal crawl schema)
         ├── parse.ts                 ← CSV/XLSX stream parsing, dbseospider, GSC CSV, inlinks
-        ├── detect.ts                ← 24-rule detection engine
+        ├── detect.ts                ← 47-rule detection engine
         ├── analysis.ts              ← impact scores, health, delta, PageRank
         ├── modules.ts               ← hygiene, sitemap diff, redirect map, Jira CSV
         ├── robots.ts                ← robots.txt parser/matcher (server + simulator)
@@ -86,7 +103,7 @@ auditforge/
 
 ## Architecture notes (the decisions that matter)
 
-- **Parsing happens in the browser.** Vercel serverless bodies cap at ~4.5MB; large SF exports blow past that. PapaParse streams the CSV chunk-by-chunk in the client — a 50k-URL export never leaves your machine and never hits a function limit. Only *flagged URLs* are sent server-side, in batches of 8.
+- **Parsing happens in the browser.** Vercel serverless bodies cap at ~4.5MB; large SF exports blow past that. PapaParse streams the CSV chunk-by-chunk in the client — a 50k-URL export never leaves your machine and never hits a function limit. Each unique crawl URL is sent for a lightweight live status check in batches of 8; flagged URLs share that fetch and receive deeper rule-specific checks.
 - **Verification is client-driven and resumable by construction.** The client owns the queue and fires `/api/verify` batches (3 concurrent, 8 URLs each, 300ms server-side delay between URLs, robots.txt cached per origin). Each function invocation stays far under limits regardless of site size; a dropped batch marks its items `UNVERIFIABLE` with the reason instead of dying. Audit state persists to `localStorage` after every mutation — refresh and hit "Resume last audit".
 - **Every failure path surfaces a human-readable message**: unsupported file, empty export, sqlite fallback, missing API keys (501s with instructions), robots-blocked URLs, KV not configured, rate limits (429 + client backoff).
 
@@ -103,20 +120,22 @@ Copy `.env.example` → `.env.local`:
 | `PAGESPEED_API_KEY` | Module B | Module skipped with note |
 | `KV_REST_API_URL`, `KV_REST_API_TOKEN` | Shareable report links | Share button explains; JSON export still works |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | **automatic GSC connection** | Connect button explains; CSV fallback works |
+| `VERIFY_USER_AGENT` | Optional WAF/CDN identification | Uses the default AuditForge user agent |
+| `VERIFY_RATE_LIMIT` | Optional per-instance API request ceiling | Defaults to 600 requests/minute |
 | `SLACK_WEBHOOK_URL` | v2 Slack digest | unused in v1 |
 
 ## Local test walkthrough (5 minutes, no keys needed)
 
 ```bash
 npm install
-npm test          # smoke tests: detection, PageRank, robots matcher, delta, redirect map
+npm test          # smoke, detection, live-verification, queue/budget and standalone-report regressions
 npm run dev       # http://localhost:3000
 ```
 
 1. Open http://localhost:3000.
-2. (Optional but recommended) Under **All Inlinks**, add `fixtures/sample_all_inlinks.csv`.
+2. (Optional) Add `fixtures/sample_all_inlinks.csv` under **All Inlinks** for PageRank. For broken-link sources only, use Screaming Frog&apos;s smaller **Client Error (4xx) Inlinks** export in the 4xx slot.
 3. Drag **`fixtures/sample_internal_all.csv`** onto the drop zone.
-4. Watch the forge line: parse → detect (~40 flags) → **verify** → link jump (URLs found inside live page source get chased and checked too) → enrich (auto-pulls GSC data if connected). The fixture uses `example.com`, so most checks resolve or confirm against the real live site; robots/network failures land in **Unverifiable** with reasons — exactly as designed.
+4. Watch the forge line: parse → detect → **verify** → link jump (URLs found inside live page source get chased and checked too) → enrich (auto-pulls GSC data if connected). The fixture uses `example.com`; a bot block or network restriction can make results unverifiable, not broken.
 5. Explore: severity/team tabs, evidence snippets (click any row), Module D equity leaks (the fixture links to a 404 from high-PR pages), Module I robots simulator, Module M redirect exports (`/blog/old-post` chain collapses to `/blog/new-post` in 2 hops).
 6. Export **Audit JSON**, start a **New audit**, re-upload the same CSV *plus* that JSON as "previous audit" → delta report.
 7. Mark an issue **Fixed-Claimed** → "Re-verify claimed fixes" → it's promoted to **Fixed-Verified** only if the live source proves it.
@@ -159,4 +178,4 @@ No OAuth keys yet? **Search Console → Performance → Export → Download CSV 
 
 ## Extending the detection engine
 
-Add a rule in `src/lib/detect.ts` (one object: id, label, severity, owner, `test(row, ctx)` returning evidence or null), then teach `classify()` in `src/app/api/verify/route.ts` how to re-check it against live HTML. Everything else — impact scoring, report grouping, exports, AI batching — picks it up automatically.
+Add a rule in `src/lib/detect.ts` (one object: id, label, severity, owner, `test(row, ctx)` returning evidence or null), then add an explicit verifier in `src/app/api/verify/route.ts`. Unknown rules intentionally remain `UNVERIFIABLE`; they are never auto-confirmed just because a URL returned 200. Add regression cases to `scripts/verification.test.ts` and `scripts/gap-fixes.test.ts`.

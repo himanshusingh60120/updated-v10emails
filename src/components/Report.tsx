@@ -21,6 +21,8 @@ import { checkRobots, parseRobotsTxt } from "@/lib/robots";
 import { downloadText, exportAuditJson, exportXlsx } from "@/lib/exports";
 import { buildStandaloneReport } from "@/lib/report-html";
 import { splitConcatenatedUrls } from "@/lib/url-utils";
+import { describeSources, groupFixesByTemplate } from "@/lib/sources";
+import { confidenceVerdict } from "@/lib/preflight";
 
 export interface PsiResult {
   url: string;
@@ -108,10 +110,13 @@ function IssueTable({
             const a = analyses.get(i.ruleId);
             const expanded = open === i.id;
             const urlParts = splitConcatenatedUrls(i.url);
+            const sourceSummary = describeSources(i);
             const hasSources =
               (i.sourceSitemaps?.length ?? 0) > 0 ||
               (i.sourceReferringPages?.length ?? 0) > 0 ||
               (i.sourceInternalInlinks?.length ?? 0) > 0 ||
+              (i.sourceSamples?.length ?? 0) > 0 ||
+              Boolean(sourceSummary) ||
               Boolean(i.gscCoverageState);
             return (
               <Fragment key={i.id}>
@@ -171,26 +176,71 @@ function IssueTable({
                         <code className="evidence mt-1">{i.evidence}</code>
                       </div>
                       {hasSources && (
-                        <div>
+                        <div className="rounded border-l-2 border-forge bg-panel/50 px-3 py-2">
                           <span className="font-mono text-[10px] uppercase tracking-widest text-steel">
                             error source · where this url is referenced
                           </span>
-                          <code className="evidence mt-1">
-                            {[
-                              i.gscCoverageState ? `GSC indexing state: ${i.gscCoverageState}` : "",
-                              i.sourceSitemaps?.length
-                                ? `Sitemaps (GSC):\n${i.sourceSitemaps.map((s) => `  • ${s}`).join("\n")}`
-                                : "",
-                              i.sourceReferringPages?.length
-                                ? `Referring pages (GSC):\n${i.sourceReferringPages.map((s) => `  • ${s}`).join("\n")}`
-                                : "",
-                              i.sourceInternalInlinks?.length
-                                ? `Internal pages linking here (crawl / live source):\n${i.sourceInternalInlinks.map((s) => `  • ${s}`).join("\n")}`
-                                : "",
-                            ]
-                              .filter(Boolean)
-                              .join("\n")}
-                          </code>
+                          {i.targetUrl && i.targetUrl !== i.url && (
+                            <div className="mt-1 break-all font-mono text-xs text-ember">
+                              Broken URL: {i.targetUrl}
+                            </div>
+                          )}
+                          {sourceSummary && <p className="mt-1 text-xs text-slate-300">{sourceSummary}</p>}
+                          {i.sourceMatchNote && (
+                            <p className="mt-1 text-xs italic text-steel">{i.sourceMatchNote}</p>
+                          )}
+                          {Object.keys(i.sourceByPosition ?? {}).length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {Object.entries(i.sourceByPosition ?? {})
+                                .sort((a, b) => b[1] - a[1])
+                                .map(([pos, n]) => (
+                                  <span key={pos} className="chip border-edge text-steel">
+                                    {pos} × {n.toLocaleString()}
+                                  </span>
+                                ))}
+                            </div>
+                          )}
+                          {(i.sourceSamples?.length ?? 0) > 0 && (
+                            <ul className="mt-2 space-y-2">
+                              {i.sourceSamples!.slice(0, 8).map((src, n) => (
+                                <li key={`${src.url}-${n}`} className="border-t border-edge/40 pt-2 first:border-0 first:pt-0">
+                                  <div className="break-all font-mono text-xs text-slate-300">{src.url}</div>
+                                  <div className="text-[11px] text-steel">
+                                    {[src.linkType, src.linkPosition, src.rel ? `rel="${src.rel}"` : null]
+                                      .filter(Boolean)
+                                      .join(" · ")}
+                                    {src.anchor ? ` · anchor: “${src.anchor}”` : ""}
+                                  </div>
+                                  {src.linkPath && (
+                                    <div className="break-all font-mono text-[10px] text-steel/80">
+                                      XPath: {src.linkPath}
+                                    </div>
+                                  )}
+                                  {src.snippet && <code className="evidence mt-1">{src.snippet}</code>}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          {(i.sourceSamples?.length ?? 0) === 0 && (i.sourceInternalInlinks?.length ?? 0) > 0 && (
+                            <code className="evidence mt-1">
+                              {i.sourceInternalInlinks!.map((s) => `  • ${s}`).join("\n")}
+                            </code>
+                          )}
+                          {(i.gscCoverageState || i.sourceSitemaps?.length || i.sourceReferringPages?.length) && (
+                            <code className="evidence mt-2">
+                              {[
+                                i.gscCoverageState ? `GSC indexing state: ${i.gscCoverageState}` : "",
+                                i.sourceSitemaps?.length
+                                  ? `Sitemaps (GSC):\n${i.sourceSitemaps.map((s) => `  • ${s}`).join("\n")}`
+                                  : "",
+                                i.sourceReferringPages?.length
+                                  ? `Referring pages (GSC):\n${i.sourceReferringPages.map((s) => `  • ${s}`).join("\n")}`
+                                  : "",
+                              ]
+                                .filter(Boolean)
+                                .join("\n")}
+                            </code>
+                          )}
                         </div>
                       )}
                       {i.liveEvidence && (
@@ -340,6 +390,7 @@ export default function Report(props: Props) {
   const score = healthScore(audit.issues, audit.rows.length);
   const moneyLeaks = findMoneyLeaks(audit.issues, audit.gsc);
   const redirectMap = useMemo(() => buildRedirectMap(audit.rows), [audit.rows]);
+  const templateGroups = useMemo(() => groupFixesByTemplate(confirmed), [confirmed]);
   const claimed = audit.issues.filter((i) => i.fixStatus === "Fixed-Claimed").length;
 
   return (
@@ -425,6 +476,125 @@ export default function Report(props: Props) {
           </p>
         )}
       </section>
+
+      {/* Report confidence — what was checked, what could not be, and why. */}
+      {audit.preflight && (
+        <section className="space-y-3">
+          <SectionTitle>Report confidence</SectionTitle>
+          <div
+            className={`rounded border p-3 ${
+              audit.preflight.confidence >= 85
+                ? "border-mint/50 bg-mint/10"
+                : audit.preflight.confidence >= 60
+                  ? "border-forge/50 bg-forge/10"
+                  : "border-ember/50 bg-ember/10"
+            }`}
+          >
+            <p className="text-sm text-slate-200">
+              <b>{audit.preflight.confidence}/100.</b> {confidenceVerdict(audit.preflight)}
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded border border-edge bg-panel/40 p-3">
+              <p className="font-mono text-[10px] uppercase tracking-widest text-steel">inputs used</p>
+              <ul className="mt-2 space-y-1 text-xs text-slate-300">
+                <li>{audit.preflight.inputs.crawlRows.toLocaleString()} crawl rows</li>
+                <li>
+                  {audit.preflight.inputs.inlinkEdges.toLocaleString()} link-graph edges
+                  {audit.preflight.inputs.inlinkEdges === 0 && (
+                    <span className="text-ember"> — broken URLs cannot be traced to their sources</span>
+                  )}
+                </li>
+                <li>{audit.preflight.inputs.gscRows.toLocaleString()} GSC rows</li>
+                <li>{audit.preflight.inputs.sitemapEntries.toLocaleString()} sitemap URLs</li>
+                <li>
+                  Issues Overview:{" "}
+                  {audit.preflight.inputs.issuesOverview ? "supplied (counts reconciled)" : "not supplied"}
+                </li>
+              </ul>
+            </div>
+            <div className="rounded border border-edge bg-panel/40 p-3">
+              <p className="font-mono text-[10px] uppercase tracking-widest text-steel">check coverage</p>
+              <ul className="mt-2 max-h-56 space-y-1 overflow-auto text-xs">
+                {audit.preflight.ruleCoverage.map((c) => (
+                  <li key={c.label} className="flex gap-2">
+                    <span
+                      className={
+                        c.readiness === "checked"
+                          ? "text-mint"
+                          : c.readiness === "partial"
+                            ? "text-forge"
+                            : "text-ember"
+                      }
+                    >
+                      {c.readiness === "checked" ? "✓" : c.readiness === "partial" ? "◐" : "✕"}
+                    </span>
+                    <span className="text-slate-300">
+                      {c.label}
+                      {c.missing.length > 0 && (
+                        <span className="text-steel"> — no {c.missing.join(", ")} column, so this was never measured</span>
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+          {audit.preflight.signals.length > 0 && (
+            <ul className="space-y-1 text-xs">
+              {audit.preflight.signals.map((sig) => (
+                <li
+                  key={sig.id}
+                  className={
+                    sig.severity === "alarm" ? "text-ember" : sig.severity === "warn" ? "text-forge" : "text-steel"
+                  }
+                >
+                  {sig.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {/* Broken links — fix by template */}
+      {templateGroups.length > 0 && (
+        <section className="space-y-3">
+          <SectionTitle>Broken links — fix by template</SectionTitle>
+          <p className="text-sm text-steel">
+            Grouped by where the links sit. A page area with many link instances but few distinct broken URLs is one
+            template change, not one ticket per finding.
+          </p>
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b border-edge font-mono text-[10px] uppercase tracking-widest text-steel">
+                <th className="py-2 pr-3">Page area</th>
+                <th className="py-2 pr-3">Link instances</th>
+                <th className="py-2 pr-3">Distinct broken URLs</th>
+                <th className="py-2 pr-3">Source pages</th>
+                <th className="py-2">Example</th>
+              </tr>
+            </thead>
+            <tbody>
+              {templateGroups.map((t) => (
+                <tr key={t.position} className="border-b border-edge/50 align-top">
+                  <td className="py-2 pr-3 text-slate-200">{t.position}</td>
+                  <td className="py-2 pr-3 font-mono text-forge">{t.edges.toLocaleString()}</td>
+                  <td className="py-2 pr-3 font-mono">{t.brokenTargets.toLocaleString()}</td>
+                  <td className="py-2 pr-3 font-mono">{t.sourcePages.toLocaleString()}</td>
+                  <td className="py-2">
+                    <div className="break-all font-mono text-xs text-slate-300">{t.sampleTarget}</div>
+                    {t.sampleAnchor && <div className="text-[11px] text-steel">anchor: “{t.sampleAnchor}”</div>}
+                    {t.sampleXPath && (
+                      <div className="break-all font-mono text-[10px] text-steel/80">{t.sampleXPath}</div>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
+      )}
 
       {/* Verification log */}
       <section className="space-y-3">
@@ -562,8 +732,61 @@ export default function Report(props: Props) {
       {/* Module C */}
       <section className="space-y-3">
         <SectionTitle>Module C — Sitemap intelligence</SectionTitle>
+        {/*
+          Sitemap findings are ordinary Issues now, so they already appear in the
+          severity and team tables above with impact scores and fix status. What
+          this section adds is what those tables cannot show: which sitemap files
+          were fetched, how they were found, and how they behaved.
+        */}
+        {(audit.sitemapFiles?.length ?? 0) > 0 && (
+          <div className="rounded border border-edge bg-panel/40 p-3">
+            <p className="text-sm text-slate-200">
+              {(audit.sitemapEntries?.length ?? audit.sitemapUrls.length).toLocaleString()} URLs across{" "}
+              {audit.sitemapFiles!.length} file(s) ·{" "}
+              {audit.sitemapRobotsDeclared?.length
+                ? `${audit.sitemapRobotsDeclared.length} declared in robots.txt`
+                : "none declared in robots.txt"}
+            </p>
+            <table className="mt-2 w-full text-left text-xs">
+              <thead>
+                <tr className="border-b border-edge font-mono text-[10px] uppercase tracking-widest text-steel">
+                  <th className="py-1 pr-2">File</th>
+                  <th className="py-1 pr-2">Status</th>
+                  <th className="py-1 pr-2">Type</th>
+                  <th className="py-1 pr-2">URLs</th>
+                  <th className="py-1 pr-2">Found via</th>
+                  <th className="py-1">Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {audit.sitemapFiles!.slice(0, 100).map((f) => (
+                  <tr key={f.url} className="border-b border-edge/40 align-top">
+                    <td className="break-all py-1 pr-2 font-mono text-slate-300">{f.url}</td>
+                    <td className="py-1 pr-2 font-mono">{f.status || "—"}</td>
+                    <td className="py-1 pr-2">
+                      {f.kind}
+                      {f.gzipped && <span className="text-steel"> (gzip)</span>}
+                    </td>
+                    <td className="py-1 pr-2 font-mono">{f.urlCount.toLocaleString()}</td>
+                    <td className="py-1 pr-2 text-steel">{f.discoveredVia}</td>
+                    <td className="py-1">
+                      {f.error ? (
+                        <span className="text-ember">{f.error}</span>
+                      ) : (
+                        <span className="text-steel">{(f.bytes / 1024).toFixed(0)} KB</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
         {!sitemapDiff ? (
-          <p className="text-sm text-steel">Module skipped: no sitemap URL provided.</p>
+          <p className="text-sm text-steel">
+            Module skipped: no sitemap could be discovered from robots.txt or the well-known paths, and none was
+            supplied.
+          </p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-3">
             <div className="rounded border border-edge bg-panel/40 p-3">

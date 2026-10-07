@@ -9,9 +9,9 @@ import {
 } from "./schema";
 
 /**
- * Impact Score = severity weight × log2(2 + traffic signal) — the +2 floor keeps
- * zero-signal findings (e.g. link-jump discoveries) from sorting to the very bottom.
- * With GSC data: signal = clicks×10 + impressions×0.1. Without: internal inlinks.
+ * Impact Score = severity weight × log2(2 + normalized signal). Clicks,
+ * impressions and inlinks are first converted to log-counts so unlike raw units
+ * (e.g. impressions versus links) are not added directly.
  * Sorting the report by this makes teams fix what actually loses money first.
  */
 export function computeImpactScores(
@@ -24,8 +24,8 @@ export function computeImpactScores(
   return issues.map((issue) => {
     const g = gscByUrl.get(issue.url.replace(/\/$/, ""));
     const signal = g
-      ? g.clicks * 10 + g.impressions * 0.1
-      : (inlinksByUrl.get(issue.url) ?? 0);
+      ? Math.log2(1 + Math.max(0, g.clicks)) + Math.log2(1 + Math.max(0, g.impressions)) / 5
+      : Math.log2(1 + Math.max(0, inlinksByUrl.get(issue.url) ?? 0));
     return {
       ...issue,
       gscClicks: g?.clicks,
@@ -71,14 +71,26 @@ export interface DeltaReport {
 }
 
 export function computeDelta(previous: AuditState, current: AuditState): DeltaReport {
-  const prevMap = new Map(previous.issues.map((i) => [i.id, i]));
-  const curMap = new Map(current.issues.map((i) => [i.id, i]));
+  const issueKey = (issue: Issue) => {
+    try {
+      const url = new URL(issue.url);
+      url.hash = "";
+      url.searchParams.sort();
+      return `${issue.ruleId}::${url.pathname}${url.search}`;
+    } catch {
+      return issue.id;
+    }
+  };
+  const prevMap = new Map(previous.issues.map((i) => [issueKey(i), i]));
+  const curMap = new Map(current.issues.map((i) => [issueKey(i), i]));
   const newIssues = current.issues.filter(
-    (i) => !prevMap.has(i.id) && i.verification !== "RESOLVED"
+    (i) => !prevMap.has(issueKey(i)) && i.verification !== "RESOLVED"
   );
-  const fixedIssues = previous.issues.filter((i) => !curMap.has(i.id));
+  const fixedIssues = previous.issues.filter(
+    (i) => !curMap.has(issueKey(i)) && i.verification !== "RESOLVED" && i.fixStatus !== "Fixed-Verified"
+  );
   const regressed = current.issues.filter((i) => {
-    const prev = prevMap.get(i.id);
+    const prev = prevMap.get(issueKey(i));
     return (
       prev !== undefined &&
       (prev.fixStatus === "Fixed-Verified" || prev.verification === "RESOLVED") &&

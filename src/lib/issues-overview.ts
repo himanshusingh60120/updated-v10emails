@@ -121,7 +121,7 @@ export const SF_RULE_MAP: Record<string, MapEntry> = {
   "page titles: below 30 characters": {
     ruleIds: ["title-short"],
     relation: "threshold",
-    note: "Our title-short fires below 20 chars; SF's default is 30. Expect our count to be materially lower.",
+    note: "The character threshold matches Screaming Frog's default; confirm the export includes Title 1 Length.",
   },
   "page titles: over 561 pixels": {
     ruleIds: ["title-pixels-long"],
@@ -142,7 +142,7 @@ export const SF_RULE_MAP: Record<string, MapEntry> = {
   "meta description: over 155 characters": {
     ruleIds: ["meta-long"],
     relation: "threshold",
-    note: "Ours fires over 160; SF's default is 155.",
+    note: "The character threshold matches Screaming Frog's default; confirm the export includes Meta Description 1 Length.",
   },
   "meta description: below 70 characters": { ruleIds: ["meta-short"], relation: "exact" },
   "meta description: over 985 pixels": {

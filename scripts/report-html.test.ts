@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildStandaloneReport } from "@/lib/report-html";
 import { ABSENT_SCORE, AuditState, Issue } from "@/lib/schema";
 
@@ -28,7 +30,7 @@ const audit: AuditState = {
 };
 
 const html = buildStandaloneReport({ audit, hygiene: [], sitemapDiff: null,
-  redirectMap: [{ source: "https://x.com/o", finalDestination: "https://x.com/n", hops: 2 }],
+  redirectMap: [{ source: "https://x.com/o", finalDestination: "https://x.com/n", hops: 2, sourceStatus: 301 }],
   moduleNotes: ["Module C skipped: no sitemap"] });
 
 // Self-contained: no external requests of any kind
@@ -46,5 +48,5 @@ const xss = buildStandaloneReport({ audit: { ...audit,
   hygiene: [], sitemapDiff: null, redirectMap: [], moduleNotes: [] });
 if (xss.includes("<script>alert(1)")) throw new Error("XSS: unescaped evidence");
 if (!xss.includes("&lt;script&gt;alert(1)")) throw new Error("escaping did not run");
-fs.writeFileSync("/tmp/sample-report.html", html);
+fs.writeFileSync(join(tmpdir(), "auditforge-sample-report.html"), html);
 console.log(`standalone HTML report: PASS (${(html.length / 1024).toFixed(1)}KB, self-contained, escaped)`);

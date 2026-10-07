@@ -1,7 +1,14 @@
 "use client";
 import Papa from "papaparse";
 import { listZipEntries, peekZipEntry, readZipEntry, ZipEntry } from "./zip";
-import { ABSENT_SCORE, CrawlRow, CrawlRowSchema, GscRow } from "./schema";
+import {
+  ABSENT_SCORE,
+  CrawlRow,
+  CrawlRowSchema,
+  GscRow,
+  InlinkEdge,
+  normalizeLinkPosition,
+} from "./schema";
 import type { IssuesOverview, SfIssue } from "./issues-overview";
 
 /** Header aliases → normalized field. Tolerant to Screaming Frog version drift. */
@@ -89,6 +96,27 @@ export interface ParseResult {
   warnings: string[];
   /** Link edges recovered from a .dbseospider database, when its layout allows. */
   edges?: InlinkEdge[];
+  /**
+   * Raw header names the export actually carried.
+   *
+   * Every missing column silently defaults to ""/0, so a crawl exported without
+   * "Meta Description 1" produces zero meta findings — which reads in the report
+   * as "no meta problems". The preflight needs to know what was really present
+   * to tell a passed rule apart from a rule that could never run.
+   */
+  columns?: string[];
+  /** Normalized fields resolved from those headers. */
+  fieldsPresent?: (keyof CrawlRow)[];
+}
+
+/** Which normalized fields a set of raw CSV/XLSX headers maps onto. */
+export function resolveFields(headers: string[]): (keyof CrawlRow)[] {
+  const out = new Set<keyof CrawlRow>();
+  for (const h of headers) {
+    const field = HEADER_MAP[h.replace(/^\uFEFF/, "").trim().toLowerCase()];
+    if (field) out.add(field);
+  }
+  return [...out];
 }
 
 /** Stream-parse a Screaming Frog CSV export. Never holds the raw file in memory as a string. */
@@ -100,11 +128,16 @@ export function parseCrawlCsv(
     const rows: CrawlRow[] = [];
     let skipped = 0;
     let count = 0;
+    let columns: string[] = [];
     Papa.parse<Record<string, unknown>>(file, {
       header: true,
       skipEmptyLines: true,
       worker: false,
+      transformHeader: (h) => h.replace(/^\uFEFF/, "").trim(),
       chunk: (chunk) => {
+        if (columns.length === 0 && chunk.data.length > 0) {
+          columns = Object.keys(chunk.data[0] as Record<string, unknown>);
+        }
         for (const rec of chunk.data) {
           const row = normalizeRecord(rec);
           if (row && /^https?:\/\//i.test(row.url)) rows.push(row);
@@ -124,7 +157,7 @@ export function parseCrawlCsv(
           return;
         }
         if (skipped > 0) warnings.push(`${skipped.toLocaleString()} rows skipped (non-URL or unparseable).`);
-        resolve({ rows, warnings });
+        resolve({ rows, warnings, columns, fieldsPresent: resolveFields(columns) });
       },
       error: (err) => reject(new Error(`CSV parse failed: ${err.message}`)),
     });
@@ -159,7 +192,8 @@ export async function parseCrawlXlsx(
     );
   }
   const warnings = skipped ? [`${skipped.toLocaleString()} rows skipped (non-URL or unparseable).`] : [];
-  return { rows, warnings };
+  const columns = Object.keys(records[0] ?? {});
+  return { rows, warnings, columns, fieldsPresent: resolveFields(columns) };
 }
 
 const SQLITE_MAGIC = "SQLite format 3\u0000";
@@ -220,6 +254,17 @@ async function parseSqliteBytes(
         const dstCol = linkCols.find((c) => /^(destination|target|to|to_url|target_url|destination_url)$/i.test(c));
         if (!srcCol || !dstCol) continue;
         const anchorCol = linkCols.find((c) => /anchor|link_text/i.test(c));
+        // The same provenance columns the CSV path now keeps. Absent in older
+        // project layouts, which is fine — each field is optional downstream.
+        const typeCol = linkCols.find((c) => /^(type|link_type)$/i.test(c));
+        const posCol = linkCols.find((c) => /link_?position|position/i.test(c));
+        const pathCol = linkCols.find((c) => /link_?path|xpath/i.test(c));
+        const originCol = linkCols.find((c) => /link_?origin/i.test(c));
+        const altCol = linkCols.find((c) => /alt_?text/i.test(c));
+        const relCol = linkCols.find((c) => /^rel$/i.test(c));
+        const statusCol2 = linkCols.find((c) => /status_?code/i.test(c));
+        const str = (rec: Record<string, unknown>, col: string | undefined): string =>
+          col ? String(rec[col] ?? "").trim() : "";
         const linkStmt = db.prepare(`SELECT * FROM "${linkTable}"`);
         let n = 0;
         while (linkStmt.step() && n < 500_000) {
@@ -227,7 +272,19 @@ async function parseSqliteBytes(
           const src = String(rec[srcCol] ?? "");
           const dst = String(rec[dstCol] ?? "");
           if (/^https?:\/\//i.test(src) && /^https?:\/\//i.test(dst)) {
-            edges.push({ source: src, target: dst, anchor: String(rec[anchorCol ?? ""] ?? "").trim() });
+            const statusNum = parseInt(str(rec, statusCol2), 10);
+            edges.push({
+              source: src,
+              target: dst,
+              anchor: str(rec, anchorCol),
+              linkType: str(rec, typeCol) || undefined,
+              linkPosition: normalizeLinkPosition(str(rec, posCol)),
+              linkPath: str(rec, pathCol) || undefined,
+              linkOrigin: str(rec, originCol) || undefined,
+              altText: str(rec, altCol) || undefined,
+              rel: str(rec, relCol) || undefined,
+              edgeStatus: Number.isFinite(statusNum) ? statusNum : undefined,
+            });
           }
           n++;
         }
@@ -242,7 +299,13 @@ async function parseSqliteBytes(
       } else {
         warnings.push("No readable link-edge table found \u2014 upload the All Inlinks export to enable Module D.");
       }
-      return { rows, warnings, edges: edges.length > 0 ? edges : undefined };
+      return {
+        rows,
+        warnings,
+        edges: edges.length > 0 ? edges : undefined,
+        columns: cols,
+        fieldsPresent: resolveFields(cols),
+      };
     }
     throw new Error(`No table with URL + status-code columns found (tables present: ${tables.slice(0, 12).join(", ") || "none"}). ` + CSV_GUIDANCE);
   } finally {
@@ -497,46 +560,184 @@ export function parseIssuesOverviewCsv(file: File): Promise<IssuesOverview> {
   });
 }
 
-export interface InlinkEdge {
-  source: string;
-  target: string;
-  anchor: string;
-}
+/**
+ * Re-exported so existing imports from `@/lib/parse` keep working; the type now
+ * lives in schema.ts because the verification route needs it too.
+ */
+export type { InlinkEdge } from "./schema";
 
 /** Screaming Frog "All Inlinks" export: Type, Source, Destination, ... Anchor Text ... */
 export const MAX_INLINK_EDGES = 2_000_000;
 
+/**
+ * The previous parser kept `Type = Hyperlink` and threw the rest away. That
+ * single filter is why a 404 reached through a broken <img src>, a canonical
+ * pointing at a dead URL, an hreflang alternate, or a redirect landing on a 4xx
+ * arrived in the report with no source at all. Every type is kept now; callers
+ * that want hyperlinks only (PageRank) filter at the point of use.
+ */
+export function hyperlinkEdges(edges: InlinkEdge[]): InlinkEdge[] {
+  return edges.filter((e) => !e.linkType || /hyperlink/i.test(e.linkType));
+}
+
+export interface InlinksParseResult {
+  edges: InlinkEdge[];
+  warnings: string[];
+  /** Edge counts per link type, so the user can see what the export contained. */
+  byType: Record<string, number>;
+  /** True when the export carried Link Position / Link Path columns. */
+  hasPositionData: boolean;
+  truncated: boolean;
+}
+
+/** Column resolver tolerant of SF version drift and BOM-prefixed headers. */
+function columnResolver(keys: string[]) {
+  const clean = keys.map((k) => ({ raw: k, norm: k.replace(/^\uFEFF/, "").trim().toLowerCase() }));
+  return (patterns: RegExp[]): string | undefined => {
+    for (const re of patterns) {
+      const hit = clean.find((c) => re.test(c.norm));
+      if (hit) return hit.raw;
+    }
+    return undefined;
+  };
+}
+
+/** Back-compatible wrapper: same signature the rest of the app already calls. */
 export function parseAllInlinksCsv(
   file: File,
   onProgress: (n: number) => void
 ): Promise<InlinkEdge[]> {
+  return parseInlinksExport(file, onProgress).then((r) => r.edges);
+}
+
+/**
+ * Parse an inlinks-style export.
+ *
+ * Handles both `Bulk Export -> Links -> All Inlinks` and the far more useful
+ * `Bulk Export -> Response Codes -> Internal Client Error (4xx) Inlinks`, which
+ * has identical columns but is pre-filtered to broken targets — one to two
+ * orders of magnitude smaller, so people will actually upload it.
+ */
+export function parseInlinksExport(
+  file: File,
+  onProgress: (n: number) => void,
+  maxEdges: number = MAX_INLINK_EDGES
+): Promise<InlinksParseResult> {
   return new Promise((resolve, reject) => {
     const edges: InlinkEdge[] = [];
+    const byType: Record<string, number> = {};
     let count = 0;
+    let truncated = false;
+    let hasPositionData = false;
+    let resolved = false;
+    let cols: Record<string, string | undefined> = {};
+
     Papa.parse<Record<string, string>>(file, {
       header: true,
       skipEmptyLines: true,
+      transformHeader: (h) => h.replace(/^\uFEFF/, "").trim(),
       chunk: (chunk, parser) => {
-        if (edges.length >= MAX_INLINK_EDGES) {
-          parser.abort(); // memory guard \u2014 PageRank on 2M edges is already representative
+        if (edges.length >= maxEdges) {
+          truncated = true;
+          parser.abort();
           return;
         }
         for (const rec of chunk.data) {
-          const keys = Object.keys(rec);
-          const src = rec[keys.find((k) => /^source$/i.test(k)) ?? ""];
-          const dst = rec[keys.find((k) => /^destination$/i.test(k)) ?? ""];
-          const anchor = rec[keys.find((k) => /anchor/i.test(k)) ?? ""] ?? "";
-          const type = rec[keys.find((k) => /^type$/i.test(k)) ?? ""] ?? "Hyperlink";
-          if (src && dst && /hyperlink/i.test(type) && /^https?:\/\//i.test(src) && /^https?:\/\//i.test(dst)) {
-            edges.push({ source: src.trim(), target: dst.trim(), anchor: anchor.trim() });
+          if (!resolved) {
+            resolved = true;
+            const pick = columnResolver(Object.keys(rec));
+            cols = {
+              src: pick([/^source$/, /^from$/, /^source url$/]),
+              dst: pick([/^destination$/, /^destination url$/, /^to$/]),
+              anchor: pick([/^anchor text$/, /anchor/]),
+              type: pick([/^type$/, /^link type$/]),
+              alt: pick([/^alt text$/]),
+              status: pick([/^status code$/]),
+              follow: pick([/^follow$/]),
+              rel: pick([/^rel$/]),
+              linkPath: pick([/^link path$/, /^path$/]),
+              linkPosition: pick([/^link position$/, /^position$/]),
+              linkOrigin: pick([/^link origin$/, /^origin$/]),
+            };
+            if (cols.linkPath || cols.linkPosition) hasPositionData = true;
           }
+          const get = (key: string | undefined): string => (key ? String(rec[key] ?? "").trim() : "");
+
+          const src = get(cols.src);
+          const dst = get(cols.dst);
+          if (!src || !dst || !/^https?:\/\//i.test(src) || !/^https?:\/\//i.test(dst)) {
+            count++;
+            continue;
+          }
+          const rawType = get(cols.type) || "Hyperlink";
+          byType[rawType] = (byType[rawType] ?? 0) + 1;
+          const followRaw = get(cols.follow);
+          const statusRaw = parseInt(get(cols.status), 10);
+
+          edges.push({
+            source: src,
+            target: dst,
+            anchor: get(cols.anchor),
+            linkType: rawType,
+            linkPosition: normalizeLinkPosition(get(cols.linkPosition)),
+            linkPath: get(cols.linkPath) || undefined,
+            linkOrigin: get(cols.linkOrigin) || undefined,
+            altText: get(cols.alt) || undefined,
+            // SF writes "true"/"false". Anything unrecognized stays undefined
+            // rather than defaulting to followed, which would silently
+            // misreport rel="nofollow" links as passing equity.
+            follow: /^(true|yes)$/i.test(followRaw)
+              ? true
+              : /^(false|no)$/i.test(followRaw)
+                ? false
+                : undefined,
+            rel: get(cols.rel) || undefined,
+            edgeStatus: Number.isFinite(statusRaw) ? statusRaw : undefined,
+          });
           count++;
+          if (edges.length >= maxEdges) {
+            truncated = true;
+            parser.abort();
+            break;
+          }
         }
         onProgress(count);
       },
       complete: () => {
-        if (edges.length === 0) reject(new Error("No hyperlink edges found. Export Bulk Export → Links → All Inlinks."));
-        else resolve(edges);
+        if (edges.length === 0) {
+          reject(
+            new Error(
+              "No link edges found. Export Bulk Export \u2192 Links \u2192 All Inlinks, or " +
+                "Bulk Export \u2192 Response Codes \u2192 Internal Client Error (4xx) Inlinks " +
+                "(smaller, and the better input for tracing broken links)."
+            )
+          );
+          return;
+        }
+        const warnings: string[] = [];
+        if (truncated) {
+          warnings.push(
+            `Inlinks capped at ${maxEdges.toLocaleString()} edges for memory safety. Source tracing and ` +
+              `PageRank run on this sample \u2014 upload the 4xx Inlinks export instead for complete ` +
+              `broken-link sources in a fraction of the rows.`
+          );
+        }
+        if (!hasPositionData) {
+          warnings.push(
+            "This export has no Link Position / Link Path columns, so the report can name the pages that " +
+              "link to a broken URL but not where in those pages the link sits. Re-export with those " +
+              "columns to get per-template grouping."
+          );
+        }
+        const nonHyperlink = Object.entries(byType).filter(([t]) => !/hyperlink/i.test(t));
+        if (nonHyperlink.length > 0) {
+          warnings.push(
+            `Kept ${nonHyperlink.reduce((n, [, c]) => n + c, 0).toLocaleString()} non-hyperlink edges ` +
+              `(${nonHyperlink.map(([t, c]) => `${t}: ${c.toLocaleString()}`).join(", ")}) \u2014 these are how ` +
+              `broken images, canonicals and hreflang alternates get a source.`
+          );
+        }
+        resolve({ edges, warnings, byType, hasPositionData, truncated });
       },
       error: (e) => reject(new Error(`Inlinks CSV parse failed: ${e.message}`)),
     });

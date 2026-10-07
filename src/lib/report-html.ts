@@ -2,6 +2,8 @@
 import { healthGrade, healthScore } from "./analysis";
 import { HygieneFinding, RedirectEntry, SitemapDiff } from "./modules";
 import { AuditState, Issue, Severity, severityRank } from "./schema";
+import { confidenceVerdict } from "./preflight";
+import { describeSources, ERROR_SOURCE_RULES, groupFixesByTemplate, tracedUrl } from "./sources";
 
 /**
  * Builds a single self-contained .html file: all styles inline, no scripts,
@@ -19,17 +21,83 @@ const esc = (s: unknown): string =>
 /** Rows embedded per section — keeps the file emailable; XLSX has the complete set. */
 const SECTION_CAP = 750;
 
-/** Error-source block: sitemaps + referring pages (GSC URL Inspection) and crawl inlinks. */
+/**
+ * Error-source block.
+ *
+ * Answers three separate questions that the old single bullet list conflated:
+ * how many links point here, where in the page those links sit, and what the
+ * markup actually looks like. The third is what a developer needs and what the
+ * report previously never had — the linking page is only ever in hand during
+ * the verification fetch, and its HTML used to be discarded there.
+ *
+ * When nothing was found, the reason is stated. "No link graph uploaded" and
+ * "the link graph contains nothing pointing here" lead to completely different
+ * next steps, and an empty block cannot tell them apart.
+ */
 function sourcesHtml(i: Issue): string {
+  if (!ERROR_SOURCE_RULES.has(i.ruleId)) return "";
   const bits: string[] = [];
+
+  const summary = describeSources(i);
+  if (summary) bits.push(esc(summary));
+  if (i.targetUrl && i.targetUrl !== i.url) {
+    bits.push(`<b>Broken URL:</b> <span class="mono">${esc(i.targetUrl)}</span>`);
+  }
+  if (i.sourceMatchNote) bits.push(`<i>${esc(i.sourceMatchNote)}</i>`);
+
+  const positions = Object.entries(i.sourceByPosition ?? {}).sort((a, b) => b[1] - a[1]);
+  if (positions.length > 0) {
+    bits.push(
+      `<b>Where the links sit:</b> ${positions
+        .map(([pos, n]) => `${esc(pos)} × ${n.toLocaleString()}`)
+        .join(" · ")}`
+    );
+  }
+  const types = Object.entries(i.sourceByType ?? {}).filter(([t]) => !/hyperlink/i.test(t));
+  if (types.length > 0) {
+    bits.push(
+      `<b>Non-hyperlink references:</b> ${types.map(([t, n]) => `${esc(t)} × ${n.toLocaleString()}`).join(" · ")}`
+    );
+  }
+
+  const samples = i.sourceSamples ?? [];
+  if (samples.length > 0) {
+    const rows = samples
+      .slice(0, 10)
+      .map((s) => {
+        const meta = [s.linkType, s.linkPosition, s.rel ? `rel="${s.rel}"` : ""].filter(Boolean).join(" · ");
+        return `<li><span class="mono">${esc(s.url)}</span><br>
+<small>${esc(meta)}${s.anchor ? ` · anchor: &ldquo;${esc(s.anchor)}&rdquo;` : ""}</small>
+${s.linkPath ? `<br><small class="mono">XPath: ${esc(s.linkPath)}</small>` : ""}
+${s.snippet ? `<pre class="snippet">${esc(s.snippet)}</pre>` : ""}</li>`;
+      })
+      .join("");
+    const more =
+      (i.sourceInlinkCount ?? samples.length) > samples.length
+        ? `<small class="note">Showing ${Math.min(samples.length, 10)} of ${(
+            i.sourceInlinkCount ?? 0
+          ).toLocaleString()} — the XLSX "Sources" sheet has every edge.</small>`
+        : "";
+    bits.push(`<b>Linked from:</b><ul class="srcs">${rows}</ul>${more}`);
+  } else if (i.sourceInternalInlinks?.length) {
+    // Audits saved before source samples existed still round-trip through the
+    // flat list, so keep rendering it rather than showing them an empty block.
+    bits.push(
+      `<b>Internal pages linking here:</b><br>${i.sourceInternalInlinks
+        .map((s) => `&nbsp;&nbsp;• ${esc(s)}`)
+        .join("<br>")}`
+    );
+  }
+
   if (i.gscCoverageState) bits.push(`<b>GSC indexing state:</b> ${esc(i.gscCoverageState)}`);
   if (i.sourceSitemaps?.length)
     bits.push(`<b>Sitemaps (GSC):</b><br>${i.sourceSitemaps.map((s) => `&nbsp;&nbsp;• ${esc(s)}`).join("<br>")}`);
   if (i.sourceReferringPages?.length)
-    bits.push(`<b>Referring pages (GSC):</b><br>${i.sourceReferringPages.map((s) => `&nbsp;&nbsp;• ${esc(s)}`).join("<br>")}`);
-  if (i.sourceInternalInlinks?.length)
-    bits.push(`<b>Internal pages linking here (crawl):</b><br>${i.sourceInternalInlinks.map((s) => `&nbsp;&nbsp;• ${esc(s)}`).join("<br>")}`);
-  return bits.length ? `<div class="ev"><b>Error source:</b><br>${bits.join("<br>")}</div>` : "";
+    bits.push(
+      `<b>Referring pages (GSC):</b><br>${i.sourceReferringPages.map((s) => `&nbsp;&nbsp;• ${esc(s)}`).join("<br>")}`
+    );
+
+  return bits.length ? `<div class="ev src"><b>Error source</b><br>${bits.join("<br>")}</div>` : "";
 }
 
 function issueRowsHtml(issues: Issue[], analyses: Map<string, { fixSteps: string[]; codeSnippet: string; rootCause: string; explanation: string }>): string {
@@ -140,14 +208,93 @@ ${issueRowsHtml(list, analyses)}</details>`;
 <ul>${pr.opportunities.map((o) => `<li>Link from <span class="mono">${esc(o.suggestedSource)}</span> → <span class="mono">${esc(o.target)}</span><br><small>Anchor: "${esc(o.anchor)}" — ${esc(o.reason)}</small></li>`).join("")}</ul>`
     : `<p class="note">Module skipped: no link graph available (upload the All Inlinks export).</p>`;
 
-  const sitemapHtml = sitemapDiff
-    ? `<h3>In sitemap but not crawled — potential orphans (${sitemapDiff.inSitemapNotCrawled.length})</h3>
-<ul class="mono">${sitemapDiff.inSitemapNotCrawled.slice(0, 200).map((u) => `<li>${esc(u)}</li>`).join("")}</ul>
-<h3>Sitemap pollution — non-200 or non-indexable URLs listed (${sitemapDiff.sitemapPollution.length})</h3>
-<ul class="mono">${sitemapDiff.sitemapPollution.slice(0, 200).map((p) => `<li>${esc(p.url)} — <b>${esc(p.reason)}</b></li>`).join("")}</ul>
-<h3>High-traffic URLs missing from the sitemap (${sitemapDiff.gscMissingFromSitemap.length})</h3>
-<ul class="mono">${sitemapDiff.gscMissingFromSitemap.slice(0, 200).map((p) => `<li>${esc(p.url)} (${esc(p.clicks)} clicks)</li>`).join("")}</ul>`
-    : `<p class="note">Module skipped: no sitemap URL provided.</p>`;
+  // Sitemap findings are ordinary Issues now, so they already appear in the
+  // severity and team tabs with impact scores and fix status. This section adds
+  // what those tabs cannot show: which files were fetched and how they behaved.
+  const sitemapIssues = sorted.filter((i) => i.ruleId.startsWith("sitemap-"));
+  const sitemapFiles = audit.sitemapFiles ?? [];
+  const sitemapHtml =
+    sitemapFiles.length > 0 || sitemapIssues.length > 0
+      ? `<p>${(audit.sitemapEntries?.length ?? audit.sitemapUrls.length).toLocaleString()} URLs across
+${sitemapFiles.length} sitemap file(s)${
+          audit.sitemapRobotsDeclared?.length
+            ? `, ${audit.sitemapRobotsDeclared.length} declared in robots.txt`
+            : ", none declared in robots.txt"
+        }.</p>
+${
+  sitemapFiles.length > 0
+    ? `<table><thead><tr><th>Sitemap file</th><th>Status</th><th>Type</th><th>URLs</th><th>Found via</th><th>Notes</th></tr></thead><tbody>${sitemapFiles
+        .slice(0, 200)
+        .map(
+          (f) =>
+            `<tr><td class="url">${esc(f.url)}</td><td class="num">${f.status || "—"}</td><td>${esc(
+              f.kind
+            )}${f.gzipped ? " <small>(gzip)</small>" : ""}</td><td class="num">${f.urlCount.toLocaleString()}</td><td>${esc(
+              f.discoveredVia
+            )}</td><td>${f.error ? `<span style="color:var(--crit)">${esc(f.error)}</span>` : `${(f.bytes / 1024).toFixed(0)} KB`}</td></tr>`
+        )
+        .join("")}</tbody></table>`
+    : ""
+}
+${
+  sitemapIssues.length > 0
+    ? `<h3>Sitemap findings (${sitemapIssues.length.toLocaleString()})</h3>${issueRowsHtml(sitemapIssues, analyses)}`
+    : `<p class="note">No sitemap findings — every submitted URL resolves, is indexable and is self-canonical.</p>`
+}`
+      : `<p class="note">Module skipped: no sitemap could be discovered from robots.txt or the well-known paths, and none was supplied.</p>`;
+
+  // Fix-by-template: the difference between a 900-row list and a sprint plan.
+  const templates = groupFixesByTemplate(confirmed);
+  const templateHtml =
+    templates.length > 0
+      ? `<p>Broken-link findings grouped by where their links sit. A page area with many link instances but few
+distinct broken URLs is a single template change, not one ticket per finding.</p>
+<table><thead><tr><th>Page area</th><th>Link instances</th><th>Distinct broken URLs</th><th>Source pages</th><th>Example</th></tr></thead>
+<tbody>${templates
+          .map(
+            (t) =>
+              `<tr><td><b>${esc(t.position)}</b></td><td class="num">${t.edges.toLocaleString()}</td><td class="num">${t.brokenTargets.toLocaleString()}</td><td class="num">${t.sourcePages.toLocaleString()}</td><td class="url">${esc(
+                t.sampleTarget
+              )}${t.sampleAnchor ? `<br><small>anchor: &ldquo;${esc(t.sampleAnchor)}&rdquo;</small>` : ""}${
+                t.sampleXPath ? `<br><small class="mono">${esc(t.sampleXPath)}</small>` : ""
+              }</td></tr>`
+          )
+          .join("")}</tbody></table>`
+      : `<p class="note">No traced broken-link sources to group. Upload Bulk Export → Response Codes → Internal Client Error (4xx) Inlinks to enable this view.</p>`;
+
+  // Report confidence: what was checked, what could not be, and why.
+  const pf = audit.preflight;
+  const confidenceHtml = pf
+    ? `<div class="banner"><b>Confidence ${pf.confidence}/100.</b> ${esc(confidenceVerdict(pf))}</div>
+<h3>Inputs used</h3>
+<ul><li>${pf.inputs.crawlRows.toLocaleString()} crawl rows</li>
+<li>${pf.inputs.inlinkEdges.toLocaleString()} link-graph edges${
+        pf.inputs.inlinkEdges === 0 ? " — <b>broken URLs cannot be traced to their sources</b>" : ""
+      }</li>
+<li>${pf.inputs.gscRows.toLocaleString()} GSC rows</li>
+<li>${pf.inputs.sitemapEntries.toLocaleString()} sitemap URLs</li>
+<li>Screaming Frog Issues Overview: ${pf.inputs.issuesOverview ? "supplied (counts reconciled)" : "not supplied"}</li></ul>
+<h3>Check coverage</h3>
+<table><thead><tr><th>Check family</th><th>Status</th><th>Reason</th></tr></thead><tbody>${pf.ruleCoverage
+        .map(
+          (c) =>
+            `<tr><td>${esc(c.label)}</td><td><span class="sev sev-${
+              c.readiness === "checked" ? "low" : c.readiness === "partial" ? "medium" : "high"
+            }">${esc(c.readiness)}</span></td><td>${
+              c.missing.length > 0
+                ? `Export has no ${esc(c.missing.join(", "))} column — zero findings here means <b>not measured</b>, not clean.`
+                : "—"
+            }</td></tr>`
+        )
+        .join("")}</tbody></table>
+${
+  pf.signals.length > 0
+    ? `<h3>Integrity signals</h3><ul>${pf.signals
+        .map((sig) => `<li><b>${esc(sig.severity)}</b> — ${esc(sig.message)}</li>`)
+        .join("")}</ul>`
+    : ""
+}`
+    : `<p class="note">No preflight recorded for this audit.</p>`;
 
   const hygieneHtml =
     hygiene.length > 0
@@ -227,6 +374,11 @@ pre { background:#0f172a; color:#e2e8f0; padding:10px; border-radius:5px; overfl
 ul.mono li { margin:2px 0; }
 .note { color:var(--muted); font-size:13px; font-style:italic; }
 .banner { border:1px solid var(--line); background:var(--panel); border-radius:6px; padding:12px 14px; font-size:13px; }
+.ev.src { background:var(--panel); border-left:2px solid var(--forge); padding:8px 10px; margin-top:8px; }
+ul.srcs { margin:6px 0 0; padding-left:18px; }
+ul.srcs li { margin-bottom:10px; }
+pre.snippet { background:#0f1720; color:#d7e2ee; padding:7px 9px; border-radius:3px; overflow-x:auto;
+  font-size:11.5px; margin:5px 0 0; white-space:pre-wrap; word-break:break-all; }
 footer { margin-top:44px; padding-top:14px; border-top:1px solid var(--line); color:var(--muted); font-size:11.5px; }
 @media print { body { padding:0; } details { break-inside:avoid; } details:not([open]) > *:not(summary) { display:revert; } details { border:none; padding:0; } }
 </style></head><body><div class="wrap">
@@ -258,6 +410,12 @@ ${sevSections || `<p class="note">No confirmed issues.</p>`}
 
 <h2>Issues by owning team</h2>
 ${teamSections || `<p class="note">No confirmed issues.</p>`}
+
+<h2>Report confidence</h2>
+${confidenceHtml}
+
+<h2>Broken links — fix by template</h2>
+${templateHtml}
 
 <h2>Sitemap intelligence</h2>
 ${sitemapHtml}
